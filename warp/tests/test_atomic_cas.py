@@ -269,7 +269,10 @@ def test_atomic_cas_4d(test, device, dtype, register_kernels=False):
     assert_np_equal(counter_np, expected)
 
 
-devices = get_test_devices()
+# These kernels implement per-thread spinlocks, which require independent thread scheduling. AMD GPUs
+# execute the lanes of a wavefront in lockstep, so the lane holding the lock can never release it
+# while the other lanes spin, and the kernels deadlock.
+devices = [d for d in get_test_devices() if not d.is_hip]
 
 
 class TestAtomicCAS(unittest.TestCase):

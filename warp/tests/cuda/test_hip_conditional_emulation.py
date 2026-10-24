@@ -373,6 +373,8 @@ def test_body_error_restores_capture(test, device):
 
 
 def test_alloc_in_body_rejected(test, device):
+    if wp.config.hip_graph_retained_allocations:
+        test.skipTest("Bodies may allocate when HIP captures use graph-retained allocations")
     if not has_native_body_check():
         test.skipTest("Native conditional body validation is not available on this HIP build")
 

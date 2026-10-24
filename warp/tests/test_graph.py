@@ -678,6 +678,8 @@ def test_cuda_graph_alloc_transient_stream(test, device):
 
 def _insert_alloc(device=None):
     device = wp.get_device(device)
+    if device.is_hip and wp.config.hip_graph_retained_allocations:
+        raise unittest.SkipTest("HIP captures use graph-retained allocations instead of memory allocation nodes")
     node = wp._src.context.runtime.core.wp_cuda_graph_insert_alloc_node(device.context, 1)
     if not node:
         raise RuntimeError("Failed to insert alloc node")

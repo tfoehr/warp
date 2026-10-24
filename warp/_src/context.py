@@ -4599,8 +4599,9 @@ class Module:
                         arch_suffix=arch_suffix,
                         pch_dir=runtime.get_nvrtc_pch_dir(),
                         llvm_cuda=options["llvm_cuda"],
-                        # HIPRTC has no precompiled header support
-                        use_precompiled_headers=options["use_precompiled_headers"] and not device.is_hip,
+                        # HIPRTC has no precompiled header support (device is None for deviceless AOT builds)
+                        use_precompiled_headers=options["use_precompiled_headers"]
+                        and not (device.is_hip if device is not None else runtime.is_hip),
                         extra_include_dirs=options["extra_cuda_include_dirs"],
                     )
 

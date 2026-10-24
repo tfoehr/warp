@@ -9243,6 +9243,10 @@ def set_mempool_release_threshold(device: DeviceLike, threshold: int | float) ->
     half of the device's physical memory.  Greater values are interpreted as an absolute number of bytes.
     For example, 1024**3 means one GiB of memory.
 
+    On HIP/ROCm devices, Warp sets the release threshold to the maximum at initialization: releasing
+    pool memory can discard the contents of live allocations that reuse freed blocks. Lowering it
+    re-enables releases and may expose that issue.
+
     Parameters:
         device: The :class:`~warp._src.context.Device` or device identifier
           for which the operation is to be performed.

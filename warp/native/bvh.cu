@@ -288,6 +288,12 @@ __global__ void build_karras_topology(
 )
 {
     const int i = blockDim.x * blockIdx.x + threadIdx.x;
+    if (n == 1) {
+        // a single item has no internal nodes: the leaf is the root (its parent is already -1)
+        if (i == 0)
+            *root = 0;
+        return;
+    }
     if (i >= n - 1)
         return;  // n-1 internal nodes
 

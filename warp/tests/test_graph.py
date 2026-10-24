@@ -1536,8 +1536,27 @@ _topo_tests = [
     test_cuda_graph_topo_alloc_nested_streams_chain_free,
     test_cuda_graph_topo_alloc_free_serializes_dependent_streams_only,
 ]
+# Tests of the dependencies of in-capture memory free nodes. HIP rejects
+# hipGraphAddMemFreeNode() for pointers allocated during stream capture, so Warp
+# records frees on the origin stream instead (and by default backs HIP capture
+# allocations with graph-retained memory without any memory nodes, see
+# warp.config.hip_graph_retained_allocations). The free node topology checked here
+# therefore does not exist on HIP.
+_topo_free_dependency_tests = {
+    test_cuda_graph_topo_alloc_side_stream_independent_free,
+    test_cuda_graph_topo_alloc_fork_free_on_main,
+    test_cuda_graph_topo_alloc_fork_free_on_side,
+    test_cuda_graph_topo_alloc_parallel_streams_free_on_sides,
+    test_cuda_graph_topo_alloc_parallel_streams_free_on_main,
+    test_cuda_graph_topo_alloc_parallel_streams_free_on_other,
+    test_cuda_graph_topo_alloc_nested_streams_chain_free,
+    test_cuda_graph_topo_alloc_free_serializes_dependent_streams_only,
+}
 for _topo_test in _topo_tests:
-    add_function_test(TestGraph, _topo_test.__name__, _topo_test, devices=cuda_devices)
+    _topo_devices = cuda_devices
+    if _topo_test in _topo_free_dependency_tests:
+        _topo_devices = [d for d in cuda_devices if not d.is_hip]
+    add_function_test(TestGraph, _topo_test.__name__, _topo_test, devices=_topo_devices)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

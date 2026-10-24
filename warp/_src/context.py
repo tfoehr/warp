@@ -5689,6 +5689,11 @@ class Device:
             self.default_allocator = CudaDefaultAllocator(self)
             if self.is_mempool_supported:
                 self.mempool_allocator = CudaMempoolAllocator(self)
+                if self.is_hip:
+                    # ROCm can hand out memory pool blocks that were released to the OS on a
+                    # synchronization (release threshold 0, the default) without restoring the GPU
+                    # mapping, so kernels fault on them. Keep freed memory in the pool instead.
+                    runtime.core.wp_cuda_device_set_mempool_release_threshold(ordinal, 0xFFFFFFFFFFFFFFFF)
             else:
                 self.mempool_allocator = None
 

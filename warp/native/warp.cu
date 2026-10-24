@@ -1304,6 +1304,33 @@ void wp_free_device_async(void* context, void* ptr, void** dbg_node_ret)
     }
 }
 
+#if defined(__HIP_PLATFORM_AMD__)
+// hipMemcpyAsync() between device memory and pageable (unregistered) host memory does not have
+// CUDA's semantics: the copy is not ordered after work already queued on the stream, and it may
+// still access the host buffer after returning. CUDA orders the copy on the stream and has
+// consumed a pageable source (host-to-device) or filled a pageable destination (device-to-host)
+// on return, which callers rely on when uploading from temporaries or reading results back.
+// Restore those semantics for pageable host buffers by synchronizing around the copy.
+static bool hip_is_pageable_host_memory(const void* ptr)
+{
+    hipPointerAttribute_t attr;
+    if (hipPointerGetAttributes(&attr, ptr) != hipSuccess) {
+        (void)hipGetLastError();  // unknown pointers are pageable host memory
+        return true;
+    }
+    return attr.type == hipMemoryTypeUnregistered;
+}
+
+// Returns true if the copy involving host_ptr must be synchronized; drains the stream if so.
+static bool hip_begin_pageable_copy(const void* host_ptr, CUstream stream)
+{
+    if (!hip_is_pageable_host_memory(host_ptr) || wp_cuda_stream_is_capturing(stream))
+        return false;
+    check_cuda(cudaStreamSynchronize(stream));
+    return true;
+}
+#endif
+
 bool wp_memcpy_h2d(void* context, void* dest, void* src, size_t n, void* stream)
 {
     ContextGuard guard(context);
@@ -1316,7 +1343,14 @@ bool wp_memcpy_h2d(void* context, void* dest, void* src, size_t n, void* stream)
 
     begin_cuda_range(WP_TIMING_MEMCPY, cuda_stream, context, "memcpy HtoD");
 
+#if defined(__HIP_PLATFORM_AMD__)
+    const bool pageable = hip_begin_pageable_copy(src, cuda_stream);
+#endif
     bool result = check_cuda(cudaMemcpyAsync(dest, src, n, cudaMemcpyHostToDevice, cuda_stream));
+#if defined(__HIP_PLATFORM_AMD__)
+    if (result && pageable)
+        result = check_cuda(cudaStreamSynchronize(cuda_stream));
+#endif
 
     end_cuda_range(WP_TIMING_MEMCPY, cuda_stream);
 
@@ -1335,7 +1369,14 @@ bool wp_memcpy_d2h(void* context, void* dest, void* src, size_t n, void* stream)
 
     begin_cuda_range(WP_TIMING_MEMCPY, cuda_stream, context, "memcpy DtoH");
 
+#if defined(__HIP_PLATFORM_AMD__)
+    const bool pageable = hip_begin_pageable_copy(dest, cuda_stream);
+#endif
     bool result = check_cuda(cudaMemcpyAsync(dest, src, n, cudaMemcpyDeviceToHost, cuda_stream));
+#if defined(__HIP_PLATFORM_AMD__)
+    if (result && pageable)
+        result = check_cuda(cudaStreamSynchronize(cuda_stream));
+#endif
 
     end_cuda_range(WP_TIMING_MEMCPY, cuda_stream);
 

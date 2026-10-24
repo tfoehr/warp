@@ -1201,7 +1201,10 @@ add_function_test(
     TestConditionalCaptures, "test_error_alloc_else", test_error_alloc_else, devices=cuda_devices_rejecting_body_allocs
 )
 add_function_test(
-    TestConditionalCaptures, "test_error_alloc_while", test_error_alloc_while, devices=cuda_devices_rejecting_body_allocs
+    TestConditionalCaptures,
+    "test_error_alloc_while",
+    test_error_alloc_while,
+    devices=cuda_devices_rejecting_body_allocs,
 )
 add_function_test(
     TestConditionalCaptures,

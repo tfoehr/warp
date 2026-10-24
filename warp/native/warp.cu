@@ -316,6 +316,19 @@ int cuda_init()
                 check_cu(cuDeviceGetAttribute_f(
                     &g_devices[i].is_mempool_supported, CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED, device
                 ));
+#if defined(__HIP_PLATFORM_AMD__)
+                if (g_devices[i].is_mempool_supported) {
+                    // Keep freed memory in the default pool instead of releasing it at synchronization
+                    // points. With a release threshold below the pool size (the default is 0), HIP can
+                    // release physical memory backing blocks that have already been handed out again,
+                    // which silently corrupts live allocations (observed on ROCm 7.13, gfx1151).
+                    cudaMemPool_t pool;
+                    if (check_cuda(cudaDeviceGetDefaultMemPool(&pool, i))) {
+                        uint64_t threshold = UINT64_MAX;
+                        check_cuda(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &threshold));
+                    }
+                }
+#endif
                 check_cu(
                     cuDeviceGetAttribute_f(&g_devices[i].sm_count, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device)
                 );

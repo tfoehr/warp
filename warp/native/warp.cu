@@ -205,6 +205,11 @@ struct GraphAllocInfo {
     cudaGraphNode_t node = NULL;  // corresponding mem alloc node in the graph
     bool ref_exists = false;  // whether user reference still exists
     bool graph_destroyed = false;  // whether graph instance was destroyed
+#if defined(__HIP_PLATFORM_AMD__)
+    // HIP: a plain device allocation retained by the graph instead of a mem alloc node (see
+    // wp_alloc_device_async()); released with cudaFree() once graph and user reference are gone
+    bool retained = false;
+#endif
 };
 
 // Information used when deferring module unloading.
@@ -910,6 +915,35 @@ void* wp_alloc_device_async(void* context, size_t s, void* stream_, const char* 
         stream = get_current_stream(context);
 
     void* ptr = NULL;
+
+#if defined(__HIP_PLATFORM_AMD__)
+    // HIP graph memory nodes do not keep CUDA's guarantee of a fixed address that stays valid for
+    // the lifetime of the graph: relaunching (auto-free on launch) or capturing other graphs can
+    // invalidate them. During Warp captures, use a regular device allocation retained by the
+    // graph instead; the shared graph/user ownership below is otherwise unchanged.
+    if (wp_cuda_stream_is_capturing(stream) && g_captures.find(get_capture_id(stream)) != g_captures.end()) {
+        // cudaMalloc() is a capture-unsafe call, permitted in relaxed capture mode
+        cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+        check_cuda(cudaThreadExchangeStreamCaptureMode(&mode));
+        check_cuda(cudaMalloc(&ptr, s));
+        check_cuda(cudaThreadExchangeStreamCaptureMode(&mode));
+        if (ptr) {
+            GraphAllocInfo alloc_info;
+            alloc_info.capture_id = get_capture_id(stream);
+            alloc_info.context = context ? context : get_current_context();
+            alloc_info.ref_exists = true;
+            alloc_info.graph_destroyed = false;
+            alloc_info.retained = true;
+            g_graph_allocs[ptr] = alloc_info;
+            if (g_alloc_tracker.enabled)
+                g_alloc_tracker.record_alloc(
+                    ptr, s, ALLOC_KIND_DEVICE, wp_cuda_context_get_device_ordinal(context), tag
+                );
+        }
+        return ptr;
+    }
+#endif
+
     check_cuda(cudaMallocAsync(&ptr, s, stream));
 
     if (ptr) {
@@ -1062,6 +1096,11 @@ void wp_free_device_async(void* context, void* ptr, void** dbg_node_ret)
         auto capture_iter = g_captures.find(capture_id);
         if (capture_iter != g_captures.end() && capture_id == get_capture_id(capture_iter->second->stream)) {
 #if defined(__HIP_PLATFORM_AMD__)
+            if (alloc_info.retained) {
+                // the graph keeps the memory until it is destroyed (stands in for a free node)
+                alloc_info.ref_exists = false;
+                return;
+            }
             // hipGraphAddMemFreeNode rejects pointers from hipMallocAsync during
             // stream capture (hipErrorInvalidValue). It only accepts pointers from
             // hipGraphAddMemAllocNode on explicitly constructed graphs.
@@ -1189,6 +1228,17 @@ void wp_free_device_async(void* context, void* ptr, void** dbg_node_ret)
             // being captured. If the owning graph was already destroyed, we can free the
             // pointer now.
             if (alloc_info.graph_destroyed) {
+#if defined(__HIP_PLATFORM_AMD__)
+                if (alloc_info.retained) {
+                    // plain device allocation (not stream-ordered), deferred while captures are active
+                    if (g_captures.empty())
+                        check_cuda(cudaFree(ptr));
+                    else
+                        deferred_free(ptr, context, false);
+                    g_graph_allocs.erase(alloc_iter);
+                    return;
+                }
+#endif
                 if (g_captures.empty()) {
                     // try to free the pointer now
 #if defined(__HIP_PLATFORM_AMD__)
@@ -3775,7 +3825,11 @@ bool wp_cuda_graph_end_capture(void* context, void* stream, void** graph_ret)
                     // The user reference was already dropped (e.g., freed during conditional
                     // body capture). No graph instance will exist to own the allocation, so
                     // free it once graph captures complete.
+#if defined(__HIP_PLATFORM_AMD__)
+                    deferred_free(it->first, alloc_info.context, !alloc_info.retained);
+#else
                     deferred_free(it->first, alloc_info.context, true);
+#endif
                     it = g_graph_allocs.erase(it);
                     continue;
                 }

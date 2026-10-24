@@ -18,9 +18,12 @@
 #endif
 #endif  // !__HIP_PLATFORM_AMD__
 
+#include <mutex>
+#include <queue>
 #include <set>
 #include <stack>
-#include <mutex>
+#include <unordered_set>
+#include <vector>
 
 #if defined(__HIP_PLATFORM_AMD__)
 #include <vector>
@@ -102,6 +105,12 @@ typedef CUresult(CUDAAPI* PFN_cuGraphicsGLRegisterImage_v3000)(
     CUgraphicsResource* pCudaResource, wp::GLuint image, wp::GLenum target, unsigned int Flags
 );
 
+// function prototypes adapted from <cudaProfilerTypedefs.h>. We declare these locally to avoid
+// including the header, which pulls in <cudaProfiler.h>; that header ships only in the separate
+// cuda_profiler_api redist component, not the cuda_cudart component used by the builder images.
+typedef CUresult(CUDAAPI* PFN_cuProfilerStart_v4000)(void);
+typedef CUresult(CUDAAPI* PFN_cuProfilerStop_v4000)(void);
+
 
 // function pointers to driver API entry points
 // these are explicitly versioned according to cudaTypedefs.h from CUDA Toolkit WP_CUDA_TOOLKIT_VERSION
@@ -165,6 +174,7 @@ static PFN_cuModuleUnload_v2000 pfn_cuModuleUnload;
 static PFN_cuModuleGetFunction_v2000 pfn_cuModuleGetFunction;
 static PFN_cuLaunchKernel_v4000 pfn_cuLaunchKernel;
 static PFN_cuOccupancyMaxPotentialBlockSize_v6050 pfn_cuOccupancyMaxPotentialBlockSize;
+static PFN_cuOccupancyMaxActiveClusters_v11070 pfn_cuOccupancyMaxActiveClusters;
 static PFN_cuMemcpyPeerAsync_v4000 pfn_cuMemcpyPeerAsync;
 static PFN_cuPointerGetAttribute_v4000 pfn_cuPointerGetAttribute;
 static PFN_cuGraphicsMapResources_v3000 pfn_cuGraphicsMapResources;
@@ -176,11 +186,16 @@ static PFN_cuGraphicsSubResourceGetMappedArray_v3000 pfn_cuGraphicsSubResourceGe
 static PFN_cuGraphicsUnregisterResource_v3000 pfn_cuGraphicsUnregisterResource;
 static PFN_cuModuleGetGlobal_v3020 pfn_cuModuleGetGlobal;
 static PFN_cuFuncSetAttribute_v9000 pfn_cuFuncSetAttribute;
+static PFN_cuFuncGetAttribute_v2020 pfn_cuFuncGetAttribute;
 static PFN_cuIpcGetEventHandle_v4010 pfn_cuIpcGetEventHandle;
 static PFN_cuIpcOpenEventHandle_v4010 pfn_cuIpcOpenEventHandle;
 static PFN_cuIpcGetMemHandle_v4010 pfn_cuIpcGetMemHandle;
 static PFN_cuIpcOpenMemHandle_v11000 pfn_cuIpcOpenMemHandle;
 static PFN_cuIpcCloseMemHandle_v4010 pfn_cuIpcCloseMemHandle;
+
+// Profiler control functions
+static PFN_cuProfilerStart_v4000 pfn_cuProfilerStart;
+static PFN_cuProfilerStop_v4000 pfn_cuProfilerStop;
 
 // Texture functions
 static PFN_cuArrayCreate_v3020 pfn_cuArrayCreate;
@@ -193,6 +208,9 @@ static PFN_cuMemcpy3D_v3020 pfn_cuMemcpy3D;
 static PFN_cuMemcpy3DAsync_v3020 pfn_cuMemcpy3DAsync;
 static PFN_cuTexObjectCreate_v5000 pfn_cuTexObjectCreate;
 static PFN_cuTexObjectDestroy_v5000 pfn_cuTexObjectDestroy;
+static PFN_cuMipmappedArrayCreate_v5000 pfn_cuMipmappedArrayCreate;
+static PFN_cuMipmappedArrayDestroy_v5000 pfn_cuMipmappedArrayDestroy;
+static PFN_cuMipmappedArrayGetLevel_v5000 pfn_cuMipmappedArrayGetLevel;
 #endif  // !defined(__HIP_PLATFORM_AMD__)
 
 static bool cuda_driver_initialized = false;
@@ -355,6 +373,7 @@ bool init_cuda_driver()
     get_driver_entry_point("cuModuleGetFunction", 2000, &(void*&)pfn_cuModuleGetFunction);
     get_driver_entry_point("cuLaunchKernel", 4000, &(void*&)pfn_cuLaunchKernel);
     get_driver_entry_point("cuOccupancyMaxPotentialBlockSize", 6050, &(void*&)pfn_cuOccupancyMaxPotentialBlockSize);
+    get_driver_entry_point("cuOccupancyMaxActiveClusters", 11070, &(void*&)pfn_cuOccupancyMaxActiveClusters);
     get_driver_entry_point("cuMemcpyPeerAsync", 4000, &(void*&)pfn_cuMemcpyPeerAsync);
     get_driver_entry_point("cuPointerGetAttribute", 4000, &(void*&)pfn_cuPointerGetAttribute);
     get_driver_entry_point("cuGraphicsMapResources", 3000, &(void*&)pfn_cuGraphicsMapResources);
@@ -368,11 +387,16 @@ bool init_cuda_driver()
     get_driver_entry_point("cuGraphicsUnregisterResource", 3000, &(void*&)pfn_cuGraphicsUnregisterResource);
     get_driver_entry_point("cuModuleGetGlobal", 3020, &(void*&)pfn_cuModuleGetGlobal);
     get_driver_entry_point("cuFuncSetAttribute", 9000, &(void*&)pfn_cuFuncSetAttribute);
+    get_driver_entry_point("cuFuncGetAttribute", 2020, &(void*&)pfn_cuFuncGetAttribute);
     get_driver_entry_point("cuIpcGetEventHandle", 4010, &(void*&)pfn_cuIpcGetEventHandle);
     get_driver_entry_point("cuIpcOpenEventHandle", 4010, &(void*&)pfn_cuIpcOpenEventHandle);
     get_driver_entry_point("cuIpcGetMemHandle", 4010, &(void*&)pfn_cuIpcGetMemHandle);
     get_driver_entry_point("cuIpcOpenMemHandle", 11000, &(void*&)pfn_cuIpcOpenMemHandle);
     get_driver_entry_point("cuIpcCloseMemHandle", 4010, &(void*&)pfn_cuIpcCloseMemHandle);
+
+    // Profiler control functions
+    get_driver_entry_point("cuProfilerStart", 4000, &(void*&)pfn_cuProfilerStart);
+    get_driver_entry_point("cuProfilerStop", 4000, &(void*&)pfn_cuProfilerStop);
 
     // Texture functions
     get_driver_entry_point("cuArrayCreate", 3020, &(void*&)pfn_cuArrayCreate);
@@ -385,6 +409,9 @@ bool init_cuda_driver()
     get_driver_entry_point("cuMemcpy3DAsync", 3020, &(void*&)pfn_cuMemcpy3DAsync);
     get_driver_entry_point("cuTexObjectCreate", 5000, &(void*&)pfn_cuTexObjectCreate);
     get_driver_entry_point("cuTexObjectDestroy", 5000, &(void*&)pfn_cuTexObjectDestroy);
+    get_driver_entry_point("cuMipmappedArrayCreate", 5000, &(void*&)pfn_cuMipmappedArrayCreate);
+    get_driver_entry_point("cuMipmappedArrayDestroy", 5000, &(void*&)pfn_cuMipmappedArrayDestroy);
+    get_driver_entry_point("cuMipmappedArrayGetLevel", 5000, &(void*&)pfn_cuMipmappedArrayGetLevel);
 
     if (pfn_cuInit)
         cuda_driver_initialized = check_cu(pfn_cuInit(0));
@@ -471,6 +498,182 @@ bool get_graph_leaf_nodes(cudaGraph_t graph, std::vector<cudaGraphNode_t>& leaf_
     return true;
 }
 
+// get all leaf nodes that depend on the given ancestor node
+bool get_dependent_leaf_nodes(cudaGraphNode_t ancestor, std::vector<cudaGraphNode_t>& leaf_nodes_ret)
+{
+    if (!ancestor)
+        return false;
+
+    std::queue<cudaGraphNode_t> frontier { { ancestor } };
+    std::unordered_set<cudaGraphNode_t> visited { ancestor };
+    std::vector<cudaGraphNode_t> deps;
+
+    leaf_nodes_ret.clear();
+
+    while (!frontier.empty()) {
+        cudaGraphNode_t node = frontier.front();
+        frontier.pop();
+
+        size_t dep_count = 0;
+        if (!check_cu(cuGraphNodeGetDependentNodes_f(node, NULL, &dep_count)))
+            return false;
+
+        if (dep_count == 0) {
+            leaf_nodes_ret.push_back(node);
+        } else {
+            deps.resize(dep_count);
+            if (!check_cu(cuGraphNodeGetDependentNodes_f(node, deps.data(), &dep_count)))
+                return false;
+            for (cudaGraphNode_t dep : deps) {
+                if (visited.insert(dep).second) {
+                    frontier.push(dep);
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+// whether argument node depends on referent node
+NodeDependencyResult graph_node_depends_on(cudaGraphNode_t argument, cudaGraphNode_t referent)
+{
+    if (!argument || !referent)
+        return NODE_DEPENDENCY_RESULT_ERROR;
+
+    std::queue<cudaGraphNode_t> frontier { { referent } };
+    std::unordered_set<cudaGraphNode_t> visited { referent };
+    std::vector<cudaGraphNode_t> deps;
+
+    while (!frontier.empty()) {
+        cudaGraphNode_t node = frontier.front();
+        frontier.pop();
+
+        if (node == argument)
+            return NODE_DEPENDENCY_RESULT_DEPENDENT;
+
+        size_t dep_count = 0;
+        if (!check_cu(cuGraphNodeGetDependentNodes_f(node, NULL, &dep_count)))
+            return NODE_DEPENDENCY_RESULT_ERROR;
+
+        if (dep_count > 0) {
+            deps.resize(dep_count);
+            if (!check_cu(cuGraphNodeGetDependentNodes_f(node, deps.data(), &dep_count)))
+                return NODE_DEPENDENCY_RESULT_ERROR;
+            for (cudaGraphNode_t dep : deps) {
+                if (visited.insert(dep).second) {
+                    frontier.push(dep);
+                }
+            }
+        }
+    }
+
+    return NODE_DEPENDENCY_RESULT_INDEPENDENT;
+}
+
+// determine the status of an allocation at the given query node
+GraphAllocQueryResult graph_alloc_query(cudaGraphNode_t alloc_node, cudaGraphNode_t query_node)
+{
+    if (!alloc_node || !query_node)
+        return GRAPH_ALLOC_QUERY_RESULT_ERROR;
+
+    CUgraphNodeType alloc_node_type;
+    if (!check_cu(cuGraphNodeGetType_f(alloc_node, &alloc_node_type)))
+        return GRAPH_ALLOC_QUERY_RESULT_ERROR;
+    if (alloc_node_type != CU_GRAPH_NODE_TYPE_MEM_ALLOC)
+        return GRAPH_ALLOC_QUERY_RESULT_ERROR;
+
+    // get the allocation pointer so we can locate the matching free node (if any)
+    cudaMemAllocNodeParams alloc_params;
+    if (!check_cuda(cudaGraphMemAllocNodeGetParams(alloc_node, &alloc_params)))
+        return GRAPH_ALLOC_QUERY_RESULT_ERROR;
+    void* alloc_ptr = alloc_params.dptr;
+
+    // BFS from the alloc node to locate the matching free node and to
+    // determine whether the query node is a descendant of the alloc.
+    std::queue<cudaGraphNode_t> frontier { { alloc_node } };
+    std::unordered_set<cudaGraphNode_t> visited { alloc_node };
+    std::vector<cudaGraphNode_t> deps;
+    cudaGraphNode_t free_node = NULL;
+    bool query_reachable = false;
+
+    while (!frontier.empty()) {
+        cudaGraphNode_t node = frontier.front();
+        frontier.pop();
+
+        // record if the query node is reachable from the alloc
+        if (node == query_node)
+            query_reachable = true;
+
+        // record the first free node that matches the alloc pointer
+        // - there should only be one free for this alloc, we're not tackling
+        //   double-free errors here.
+        // - after the alloc is freed, subsequent alloc and free nodes can reuse
+        //   the same pointer value, but we don't care about those.
+        if (!free_node && node != alloc_node) {
+            CUgraphNodeType node_type;
+            if (!check_cu(cuGraphNodeGetType_f(node, &node_type)))
+                return GRAPH_ALLOC_QUERY_RESULT_ERROR;
+            if (node_type == CU_GRAPH_NODE_TYPE_MEM_FREE) {
+                void* free_ptr = NULL;
+                if (!check_cuda(cudaGraphMemFreeNodeGetParams(node, &free_ptr)))
+                    return GRAPH_ALLOC_QUERY_RESULT_ERROR;
+                if (free_ptr == alloc_ptr)
+                    free_node = node;
+            }
+        }
+
+        size_t dep_count = 0;
+        if (!check_cu(cuGraphNodeGetDependentNodes_f(node, NULL, &dep_count)))
+            return GRAPH_ALLOC_QUERY_RESULT_ERROR;
+
+        if (dep_count > 0) {
+            deps.resize(dep_count);
+            if (!check_cu(cuGraphNodeGetDependentNodes_f(node, deps.data(), &dep_count)))
+                return GRAPH_ALLOC_QUERY_RESULT_ERROR;
+            for (cudaGraphNode_t dep : deps) {
+                if (visited.insert(dep).second)
+                    frontier.push(dep);
+            }
+        }
+    }
+
+    if (!query_reachable) {
+        // query node does not depend on alloc, so allocation is inaccessible
+        return GRAPH_ALLOC_QUERY_RESULT_INACCESSIBLE;
+    }
+
+    if (!free_node) {
+        // alloc is never freed in the graph
+        return GRAPH_ALLOC_QUERY_RESULT_AVAILABLE;
+    }
+
+    // Query node depends on the alloc and a free node was found, so we need to check
+    // the relationship between the query node and the free node:
+    // - If the query node depends on the free node, then the allocation is guaranteed
+    //   to be freed before the query node is reached.
+    // - If the free node depends on the query node, then the allocation is guaranteed
+    //   to be available when the query node is reached.
+    // - If the query node and free node are independent, then they can execute
+    //   concurrently leading to potential use-after-free errors.
+
+    // check if the query node executes after the free node
+    NodeDependencyResult q_after_f = graph_node_depends_on(query_node, free_node);
+    if (q_after_f == NODE_DEPENDENCY_RESULT_ERROR)
+        return GRAPH_ALLOC_QUERY_RESULT_ERROR;
+    if (q_after_f == NODE_DEPENDENCY_RESULT_DEPENDENT)
+        return GRAPH_ALLOC_QUERY_RESULT_FREED;
+
+    // check if the free node executes after the query node
+    NodeDependencyResult f_after_q = graph_node_depends_on(free_node, query_node);
+    if (f_after_q == NODE_DEPENDENCY_RESULT_ERROR)
+        return GRAPH_ALLOC_QUERY_RESULT_ERROR;
+    if (f_after_q == NODE_DEPENDENCY_RESULT_DEPENDENT)
+        return GRAPH_ALLOC_QUERY_RESULT_AVAILABLE;
+
+    // free is independent of the query node, potentially causing use-after-free errors
+    return GRAPH_ALLOC_QUERY_RESULT_USE_AFTER_FREE;
+}
 
 #define DRIVER_ENTRY_POINT_ERROR driver_entry_point_error(__FUNCTION__)
 
@@ -750,6 +953,21 @@ CUresult cuCtxSynchronize_f()
     return pfn_cuCtxSynchronize ? pfn_cuCtxSynchronize() : DRIVER_ENTRY_POINT_ERROR;
 #endif  // defined(__HIP_PLATFORM_AMD__)
 }
+
+#if defined(__HIP_PLATFORM_AMD__)
+// hipProfilerStart/Stop are deprecated in favor of roctracer/rocTX, but remain the closest
+// equivalent of cuProfilerStart/Stop for toggling collection from rocprof.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+CUresult cuProfilerStart_f() { return hipProfilerStart(); }
+
+CUresult cuProfilerStop_f() { return hipProfilerStop(); }
+#pragma GCC diagnostic pop
+#else
+CUresult cuProfilerStart_f() { return pfn_cuProfilerStart ? pfn_cuProfilerStart() : DRIVER_ENTRY_POINT_ERROR; }
+
+CUresult cuProfilerStop_f() { return pfn_cuProfilerStop ? pfn_cuProfilerStop() : DRIVER_ENTRY_POINT_ERROR; }
+#endif  // defined(__HIP_PLATFORM_AMD__)
 
 CUresult cuCtxGetDevice_f(CUdevice* dev)
 {
@@ -1242,12 +1460,52 @@ CUresult cuModuleGetGlobal_f(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, co
 #endif  // defined(__HIP_PLATFORM_AMD__)
 }
 
+CUresult cuOccupancyMaxActiveClusters_f(int* numClusters, CUfunction func, const CUlaunchConfig* config)
+{
+#if defined(__HIP_PLATFORM_AMD__)
+    // thread block clusters are not available on AMD GPUs
+    if (numClusters)
+        *numClusters = 0;
+    return hipErrorNotSupported;
+#else
+    return pfn_cuOccupancyMaxActiveClusters ? pfn_cuOccupancyMaxActiveClusters(numClusters, func, config)
+                                            : DRIVER_ENTRY_POINT_ERROR;
+#endif  // defined(__HIP_PLATFORM_AMD__)
+}
+
 CUresult cuFuncSetAttribute_f(CUfunction hfunc, CUfunction_attribute attrib, int value)
 {
 #if defined(__HIP_PLATFORM_AMD__)
-    return hipFuncSetAttribute(hfunc, static_cast<hipFuncAttribute>(attrib), value);
+    // hipFuncSetAttribute() only accepts host-registered kernels, not module functions obtained
+    // via hipModuleGetFunction(), and AMD GPUs do not require an opt-in for dynamic LDS.
+    // Validate the request against the device limit instead of forwarding it.
+    if (attrib == CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES) {
+        int device = 0;
+        int max_smem = 0;
+        int static_smem = 0;
+        hipError_t res = hipGetDevice(&device);
+        if (res == hipSuccess)
+            res = hipDeviceGetAttribute(&max_smem, hipDeviceAttributeMaxSharedMemoryPerBlock, device);
+        if (res == hipSuccess)
+            res = hipFuncGetAttribute(&static_smem, HIP_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, hfunc);
+        if (res != hipSuccess)
+            return res;
+        return (value >= 0 && value + static_smem <= max_smem) ? hipSuccess : hipErrorInvalidValue;
+    }
+    if (attrib == CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT)
+        return hipSuccess;  // hint is ignored on AMD GPUs
+    return hipErrorNotSupported;
 #else
     return pfn_cuFuncSetAttribute ? pfn_cuFuncSetAttribute(hfunc, attrib, value) : DRIVER_ENTRY_POINT_ERROR;
+#endif  // defined(__HIP_PLATFORM_AMD__)
+}
+
+CUresult cuFuncGetAttribute_f(int* pi, CUfunction_attribute attrib, CUfunction hfunc)
+{
+#if defined(__HIP_PLATFORM_AMD__)
+    return hipFuncGetAttribute(pi, attrib, hfunc);
+#else
+    return pfn_cuFuncGetAttribute ? pfn_cuFuncGetAttribute(pi, attrib, hfunc) : DRIVER_ENTRY_POINT_ERROR;
 #endif  // defined(__HIP_PLATFORM_AMD__)
 }
 
@@ -1405,6 +1663,39 @@ CUresult cuTexObjectDestroy_f(CUtexObject texObject)
     return hipTexObjectDestroy(texObject);
 #else
     return pfn_cuTexObjectDestroy ? pfn_cuTexObjectDestroy(texObject) : DRIVER_ENTRY_POINT_ERROR;
+#endif  // defined(__HIP_PLATFORM_AMD__)
+}
+
+CUresult cuMipmappedArrayCreate_f(
+    CUmipmappedArray* pHandle, const CUDA_ARRAY3D_DESCRIPTOR* pMipmappedArrayDesc, unsigned int numMipmapLevels
+)
+{
+#if defined(__HIP_PLATFORM_AMD__)
+    return hipMipmappedArrayCreate(
+        pHandle, const_cast<CUDA_ARRAY3D_DESCRIPTOR*>(pMipmappedArrayDesc), numMipmapLevels
+    );
+#else
+    return pfn_cuMipmappedArrayCreate ? pfn_cuMipmappedArrayCreate(pHandle, pMipmappedArrayDesc, numMipmapLevels)
+                                      : DRIVER_ENTRY_POINT_ERROR;
+#endif  // defined(__HIP_PLATFORM_AMD__)
+}
+
+CUresult cuMipmappedArrayDestroy_f(CUmipmappedArray hMipmappedArray)
+{
+#if defined(__HIP_PLATFORM_AMD__)
+    return hipMipmappedArrayDestroy(hMipmappedArray);
+#else
+    return pfn_cuMipmappedArrayDestroy ? pfn_cuMipmappedArrayDestroy(hMipmappedArray) : DRIVER_ENTRY_POINT_ERROR;
+#endif  // defined(__HIP_PLATFORM_AMD__)
+}
+
+CUresult cuMipmappedArrayGetLevel_f(CUarray* pLevelArray, CUmipmappedArray hMipmappedArray, unsigned int level)
+{
+#if defined(__HIP_PLATFORM_AMD__)
+    return hipMipmappedArrayGetLevel(pLevelArray, hMipmappedArray, level);
+#else
+    return pfn_cuMipmappedArrayGetLevel ? pfn_cuMipmappedArrayGetLevel(pLevelArray, hMipmappedArray, level)
+                                        : DRIVER_ENTRY_POINT_ERROR;
 #endif  // defined(__HIP_PLATFORM_AMD__)
 }
 

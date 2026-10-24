@@ -11,19 +11,19 @@ from warp.tests.unittest_utils import *
 
 
 @wp.kernel
-def inc(a: wp.array(dtype=float)):
+def inc(a: wp.array[float]):
     tid = wp.tid()
     a[tid] = a[tid] + 1.0
 
 
 @wp.kernel
-def inc_new(src: wp.array(dtype=float), dst: wp.array(dtype=float)):
+def inc_new(src: wp.array[float], dst: wp.array[float]):
     tid = wp.tid()
     dst[tid] = src[tid] + 1.0
 
 
 @wp.kernel
-def sum(a: wp.array(dtype=float), b: wp.array(dtype=float), c: wp.array(dtype=float)):
+def sum(a: wp.array[float], b: wp.array[float], c: wp.array[float]):
     tid = wp.tid()
     c[tid] = a[tid] + b[tid]
 
@@ -331,11 +331,6 @@ def test_event_elapsed_time(test, device):
 
 
 def test_event_elapsed_time_graph(test, device):
-    if wp.get_device(device).is_hip:
-        # ROCm limitation: hipEventElapsedTime() on timing events recorded inside
-        # a captured graph fails with "invalid resource handle" (HIP error 400).
-        test.skipTest("Event timing inside a captured graph is not supported on HIP/ROCm")
-
     stream = wp.get_stream(device)
     e1 = wp.Event(device, enable_timing=True)
     e2 = wp.Event(device, enable_timing=True)
@@ -359,12 +354,6 @@ def test_event_elapsed_time_graph(test, device):
 
 
 def test_event_external(test, device):
-    if wp.get_device(device).is_hip:
-        # ROCm limitation: an external event recorded in one captured graph does
-        # not reliably synchronize a wait_event() in a separately-captured graph
-        # launched on another stream, producing a race (non-deterministic result).
-        test.skipTest("External event synchronization across captured graphs is not supported on HIP/ROCm")
-
     with wp.ScopedDevice(device):
         # event used to synchronize two graphs (external event)
         event = wp.Event()
@@ -455,17 +444,11 @@ def test_stream_priority_timings(test, device):
     elapsed_lo = wp.get_event_elapsed_time(start_lo_event, end_lo_event)
     elapsed_hi = wp.get_event_elapsed_time(start_hi_event, end_hi_event)
 
-    if wp.get_device(device).is_hip:
-        # Stream ordering is not guaranteed on HIP
-        test.assertGreaterEqual(elapsed_lo, 0.0)
-        test.assertGreaterEqual(elapsed_hi, 0.0)
-        return
-
     test.assertLess(elapsed_hi, elapsed_lo, "Copies on higher-priority stream should be faster.")
 
 
 @wp.kernel
-def sum_threads(sum: wp.array(dtype=wp.uint64)):
+def sum_threads(sum: wp.array[wp.uint64]):
     i = wp.tid()
     wp.atomic_add(sum, 0, wp.uint64(1))
 
@@ -556,7 +539,6 @@ def test_synchronize_during_capture(test, device):
 
 
 devices = get_selected_cuda_test_devices()
-graph_devices = [d for d in devices if d.supports_graph_capture]
 
 
 class TestStreams(unittest.TestCase):
@@ -583,8 +565,6 @@ class TestStreams(unittest.TestCase):
     @unittest.skipUnless(len(wp.get_cuda_devices()) > 1, "Requires at least two CUDA devices")
     @unittest.skipUnless(check_p2p(), "Peer-to-Peer transfers not supported")
     def test_stream_arg_graph_mgpu(self):
-        if not all(d.supports_graph_capture for d in wp.get_cuda_devices()):
-            self.skipTest("Graph capture is not supported on all CUDA devices")
         wp.load_module(device="cuda:0")
         wp.load_module(device="cuda:1")
 
@@ -635,8 +615,6 @@ class TestStreams(unittest.TestCase):
     @unittest.skipUnless(len(wp.get_cuda_devices()) > 1, "Requires at least two CUDA devices")
     @unittest.skipUnless(check_p2p(), "Peer-to-Peer transfers not supported")
     def test_stream_scope_graph_mgpu(self):
-        if not all(d.supports_graph_capture for d in wp.get_cuda_devices()):
-            self.skipTest("Graph capture is not supported on all CUDA devices")
         wp.load_module(device="cuda:0")
         wp.load_module(device="cuda:1")
 
@@ -701,6 +679,25 @@ class TestStreams(unittest.TestCase):
         instance.__del__()
 
 
+def test_stream_is_blocking(test, device):
+    # Warp-created streams are always blocking (hardcoded at construction time, no native call)
+    warp_stream = wp.Stream(device)
+    test.assertTrue(warp_stream.is_blocking)
+
+    # The default device stream is also blocking
+    test.assertTrue(device.stream.is_blocking)
+
+    # The null stream is also blocking
+    test.assertTrue(device.null_stream.is_blocking)
+
+    # When wrapping an external handle, is_blocking is lazily evaluated via the CUDA API.
+    # Wrapping a known-blocking handle exercises this path and should still return True.
+    wrapped = wp.Stream(device, cuda_stream=warp_stream.cuda_stream)
+    test.assertIsNone(wrapped._is_blocking)  # not yet evaluated
+    test.assertTrue(wrapped.is_blocking)  # triggers native query
+    test.assertTrue(wrapped._is_blocking)  # now cached
+
+
 add_function_test(TestStreams, "test_stream_set", test_stream_set, devices=devices)
 add_function_test(TestStreams, "test_stream_arg_explicit_sync", test_stream_arg_explicit_sync, devices=devices)
 add_function_test(TestStreams, "test_stream_scope_implicit_sync", test_stream_scope_implicit_sync, devices=devices)
@@ -717,15 +714,14 @@ add_function_test(TestStreams, "test_stream_event_is_complete", test_stream_even
 
 add_function_test(TestStreams, "test_event_synchronize", test_event_synchronize, devices=devices)
 add_function_test(TestStreams, "test_event_elapsed_time", test_event_elapsed_time, devices=devices)
-add_function_test(TestStreams, "test_event_elapsed_time_graph", test_event_elapsed_time_graph, devices=graph_devices)
-add_function_test(TestStreams, "test_event_external", test_event_external, devices=graph_devices)
+add_function_test(TestStreams, "test_event_elapsed_time_graph", test_event_elapsed_time_graph, devices=devices)
+add_function_test(TestStreams, "test_event_external", test_event_external, devices=devices)
 
-add_function_test(TestStreams, "test_graph_destroy_during_capture", test_graph_destroy_during_capture, devices=graph_devices)
+add_function_test(TestStreams, "test_graph_destroy_during_capture", test_graph_destroy_during_capture, devices=devices)
 
 add_function_test(TestStreams, "test_stream_synchronize_cpu", test_stream_synchronize_cpu, devices=None)
-add_function_test(
-    TestStreams, "test_synchronize_during_capture", test_synchronize_during_capture, devices=graph_devices
-)
+add_function_test(TestStreams, "test_synchronize_during_capture", test_synchronize_during_capture, devices=devices)
+add_function_test(TestStreams, "test_stream_is_blocking", test_stream_is_blocking, devices=devices)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

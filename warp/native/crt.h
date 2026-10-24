@@ -54,6 +54,45 @@ extern "C" WP_API int _wp_isinf(double);
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__HIPCC_RTC__)
+// HIPRTC (ROCm 7.2+) ships an empty <stdint.h> and only declares the fixed-width
+// integer types inside namespace __hip_internal. When the host's <sys/types.h> is
+// reachable (pulled in by <stdlib.h>), glibc has already declared the signed types
+// (int64_t = long), so declare the matching unsigned types; otherwise re-export the
+// HIPRTC ones (64-bit = long long, as with NVRTC/Jitify).
+#if defined(__int8_t_defined) || defined(_BITS_STDINT_INTN_H)
+typedef __UINT8_TYPE__ uint8_t;
+typedef __UINT16_TYPE__ uint16_t;
+typedef __UINT32_TYPE__ uint32_t;
+typedef __UINT64_TYPE__ uint64_t;
+#else
+typedef __hip_internal::int8_t int8_t;
+typedef __hip_internal::uint8_t uint8_t;
+typedef __hip_internal::int16_t int16_t;
+typedef __hip_internal::uint16_t uint16_t;
+typedef __hip_internal::int32_t int32_t;
+typedef __hip_internal::uint32_t uint32_t;
+typedef __hip_internal::int64_t int64_t;
+typedef __hip_internal::uint64_t uint64_t;
+#endif
+typedef __INTPTR_TYPE__ intptr_t;
+typedef __UINTPTR_TYPE__ uintptr_t;
+#ifndef INT32_MAX
+#define INT8_MIN (-__INT8_MAX__ - 1)
+#define INT8_MAX __INT8_MAX__
+#define UINT8_MAX __UINT8_MAX__
+#define INT16_MIN (-__INT16_MAX__ - 1)
+#define INT16_MAX __INT16_MAX__
+#define UINT16_MAX __UINT16_MAX__
+#define INT32_MIN (-__INT32_MAX__ - 1)
+#define INT32_MAX __INT32_MAX__
+#define UINT32_MAX __UINT32_MAX__
+#define INT64_MIN (-__INT64_MAX__ - 1)
+#define INT64_MAX __INT64_MAX__
+#define UINT64_MAX __UINT64_MAX__
+#endif
+#endif  // __HIPCC_RTC__
+
 #else
 
 // These definitions are taken from Jitify: https://github.com/NVIDIA/jitify
@@ -260,6 +299,10 @@ float log10f(float);
 double log10(double);
 float expf(float);
 double exp(double);
+float exp2f(float);
+double exp2(double);
+float ldexpf(float, int);
+double ldexp(double, int);
 float sqrtf(float);
 double sqrt(double);
 float cbrtf(float);

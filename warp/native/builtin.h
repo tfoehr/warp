@@ -83,6 +83,18 @@ __device__ inline void __debugbreak() { __builtin_trap(); }
 #include <cuda_fp16.h>
 #endif
 
+// NVRTC compiles Warp modules with --device-as-default-execution-space so unannotated
+// helpers are usable from kernels. HIP (HIPRTC and hipcc) has no such option, so treat
+// every unannotated function in Warp's native headers as __host__ __device__ instead.
+// The region is closed at the end of this file, after the trailing header includes.
+// Foreign headers (HIP runtime, libstdc++, rocWMMA) must keep their own execution-space
+// attributes: headers that include them inside the region suspend it while
+// WP_HIP_HOST_DEVICE_REGION is defined.
+#if defined(__HIP__) && !defined(WP_HIP_NO_FORCE_HOST_DEVICE)
+#define WP_HIP_HOST_DEVICE_REGION 1
+#pragma clang force_cuda_host_device begin
+#endif
+
 namespace wp {
 
 // numeric types (used from generated kernels)
@@ -112,10 +124,12 @@ CUDA_CALLABLE half float_to_half(float x);
 CUDA_CALLABLE float half_to_float(half x);
 
 struct half {
-    CUDA_CALLABLE inline half()
-        : u(0)
-    {
-    }
+    // Keep the payload uninitialized so half remains trivially default
+    // constructible. Value initialization, e.g. half{}, still produces zero.
+    // Keep this unannotated: NVCC ignores CUDA annotations on explicitly
+    // defaulted constructors and emits warning #20012.
+    // cppcheck-suppress uninitMemberVar
+    half() = default;
 
     CUDA_CALLABLE inline half(float f) { *this = float_to_half(f); }
 
@@ -190,10 +204,13 @@ CUDA_CALLABLE wp_bfloat16 float_to_bfloat16(float x);
 CUDA_CALLABLE float bfloat16_to_float(wp_bfloat16 x);
 
 struct wp_bfloat16 {
-    CUDA_CALLABLE inline wp_bfloat16()
-        : u(0)
-    {
-    }
+    // Keep the payload uninitialized so wp_bfloat16 remains trivially default
+    // constructible. Value initialization, e.g. wp_bfloat16{}, still produces zero.
+    // Keep this unannotated: NVCC ignores CUDA annotations on explicitly
+    // defaulted constructors and emits warning #20012.
+    // cppcheck-suppress uninitMemberVar
+    wp_bfloat16() = default;
+
     CUDA_CALLABLE inline wp_bfloat16(float f) { *this = float_to_bfloat16(f); }
 
     unsigned short u;
@@ -296,6 +313,21 @@ inline __device__ float16 approx_div(float16 a, float16 b)
 }
 
 #ifndef WP_NO_BFLOAT16
+inline __device__ bfloat16 approx_div(bfloat16 a, bfloat16 b) { return bfloat16(approx_div(float(a), float(b))); }
+#endif
+
+#elif defined(__HIP_DEVICE_COMPILE__)
+
+// AMD: v_rcp_f32 / v_rcp_f64 are single-instruction approximate reciprocals (1 ulp for f32),
+// comparable to PTX rcp.approx; div.approx is emulated as a * rcp(b) like on CUDA.
+inline __device__ float approx_rcp(float a) { return __builtin_amdgcn_rcpf(a); }
+inline __device__ double approx_rcp(double a) { return __builtin_amdgcn_rcp(a); }
+inline __device__ float16 approx_rcp(float16 a) { return float16(approx_rcp(float(a))); }
+inline __device__ float approx_div(float a, float b) { return a * __builtin_amdgcn_rcpf(b); }
+inline __device__ double approx_div(double a, double b) { return a * approx_rcp(b); }
+inline __device__ float16 approx_div(float16 a, float16 b) { return float16(approx_div(float(a), float(b))); }
+#ifndef WP_NO_BFLOAT16
+inline __device__ bfloat16 approx_rcp(bfloat16 a) { return bfloat16(approx_rcp(float(a))); }
 inline __device__ bfloat16 approx_div(bfloat16 a, bfloat16 b) { return bfloat16(approx_div(float(a), float(b))); }
 #endif
 
@@ -605,15 +637,6 @@ CUDA_CALLABLE inline void adj_cast_float(float64 x, float64& adj_x, float adj_re
 
 template <typename T> CUDA_CALLABLE inline void adj_cast_int(T x, T& adj_x, int adj_ret) { }
 
-template <typename T> CUDA_CALLABLE inline void adj_int8(T, T&, int8) { }
-template <typename T> CUDA_CALLABLE inline void adj_uint8(T, T&, uint8) { }
-template <typename T> CUDA_CALLABLE inline void adj_int16(T, T&, int16) { }
-template <typename T> CUDA_CALLABLE inline void adj_uint16(T, T&, uint16) { }
-template <typename T> CUDA_CALLABLE inline void adj_int32(T, T&, int32) { }
-template <typename T> CUDA_CALLABLE inline void adj_uint32(T, T&, uint32) { }
-template <typename T> CUDA_CALLABLE inline void adj_int64(T, T&, int64) { }
-template <typename T> CUDA_CALLABLE inline void adj_uint64(T, T&, uint64) { }
-
 
 template <typename T> CUDA_CALLABLE inline void adj_float16(T x, T& adj_x, float16 adj_ret) { adj_x += T(adj_ret); }
 #ifndef WP_NO_BFLOAT16
@@ -637,7 +660,6 @@ inline CUDA_CALLABLE T max(T a, T b) { return a>b?a:b; } \
 inline CUDA_CALLABLE T clamp(T x, T a, T b) { return min(max(a, x), b); } \
 inline CUDA_CALLABLE T floordiv(T a, T b) { return a/b; } \
 inline CUDA_CALLABLE T nonzero(T x) { return x == T(0) ? T(0) : T(1); } \
-inline CUDA_CALLABLE T sqrt(T x) { return 0; } \
 inline CUDA_CALLABLE T bit_and(T a, T b) { return a&b; } \
 inline CUDA_CALLABLE T bit_or(T a, T b) { return a|b; } \
 inline CUDA_CALLABLE T bit_xor(T a, T b) { return a^b; } \
@@ -657,7 +679,7 @@ inline CUDA_CALLABLE void adj_clamp(T x, T a, T b, T& adj_x, T& adj_a, T& adj_b,
 inline CUDA_CALLABLE void adj_floordiv(T a, T b, T& adj_a, T& adj_b, T adj_ret) { } \
 inline CUDA_CALLABLE void adj_step(T x, T& adj_x, T adj_ret) { } \
 inline CUDA_CALLABLE void adj_nonzero(T x, T& adj_x, T adj_ret) { } \
-inline CUDA_CALLABLE void adj_sqrt(T x, T adj_x, T& adj_ret) { } \
+inline CUDA_CALLABLE void adj_atomic_minmax(T* buf, T* adj_buf, const T& value, T& adj_value) { } \
 inline CUDA_CALLABLE void adj_bit_and(T a, T b, T& adj_a, T& adj_b, T adj_ret) { } \
 inline CUDA_CALLABLE void adj_bit_or(T a, T b, T& adj_a, T& adj_b, T adj_ret) { } \
 inline CUDA_CALLABLE void adj_bit_xor(T a, T b, T& adj_a, T& adj_b, T adj_ret) { } \
@@ -741,17 +763,85 @@ inline CUDA_CALLABLE void print(float f) { printf("%g\n", f); }
 inline CUDA_CALLABLE void print(double f) { printf("%g\n", f); }
 
 
+// Native fmin/fmax helpers used by min/max/clamp on float types. C semantics:
+// returns the non-NaN argument when exactly one is NaN; NaN only when both are
+// NaN. Lowers to a single-instruction intrinsic on CUDA (libdevice __nv_fminf).
+// On host, the ordered-compare + `b == b` form inlines on every compiler;
+// ::fminf, __builtin_fminf, and ::isnan are all slower (function call or
+// library dependency, depending on the toolchain). half/bfloat16 round-trip
+// through float losslessly because the result is always one of the inputs.
+//
+// Concrete per-type overloads, intentionally NO `template <typename T>`
+// fallback: with a template fallback in scope, Clang (< 21) considers it as a
+// candidate for every `_wp_native_fmin(a, b)` call inside DECLARE_FLOAT_OPS,
+// adding ~7ms (~10%) to JIT compile time per kernel TU. LLVM 21+ would
+// resolve it via P3606R0 perfect-match candidate elision.
+inline CUDA_CALLABLE float _wp_native_fmin(float a, float b)
+{
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    return ::fminf(a, b);
+#else
+    return (a <= b) ? a : ((b == b) ? b : a);
+#endif
+}
+inline CUDA_CALLABLE double _wp_native_fmin(double a, double b)
+{
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    return ::fmin(a, b);
+#else
+    return (a <= b) ? a : ((b == b) ? b : a);
+#endif
+}
+inline CUDA_CALLABLE half _wp_native_fmin(half a, half b) { return half(_wp_native_fmin(float(a), float(b))); }
+#ifndef WP_NO_BFLOAT16
+inline CUDA_CALLABLE bfloat16 _wp_native_fmin(bfloat16 a, bfloat16 b)
+{
+    return bfloat16(_wp_native_fmin(float(a), float(b)));
+}
+#endif
+
+inline CUDA_CALLABLE float _wp_native_fmax(float a, float b)
+{
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    return ::fmaxf(a, b);
+#else
+    return (a >= b) ? a : ((b == b) ? b : a);
+#endif
+}
+inline CUDA_CALLABLE double _wp_native_fmax(double a, double b)
+{
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    return ::fmax(a, b);
+#else
+    return (a >= b) ? a : ((b == b) ? b : a);
+#endif
+}
+inline CUDA_CALLABLE half _wp_native_fmax(half a, half b) { return half(_wp_native_fmax(float(a), float(b))); }
+#ifndef WP_NO_BFLOAT16
+inline CUDA_CALLABLE bfloat16 _wp_native_fmax(bfloat16 a, bfloat16 b)
+{
+    return bfloat16(_wp_native_fmax(float(a), float(b)));
+}
+#endif
+
 // basic ops for float types
+//
+// min/max/clamp on floats follow C fmin/fmax semantics: NaN is treated as
+// "missing", so the operation returns the non-NaN operand when exactly one
+// is NaN, and NaN only when both are NaN. Adjoint variants route gradient
+// to whichever operand the forward picked (the non-NaN one, or the smaller
+// / larger when both are finite). Integer min/max in DECLARE_INT_OPS keep
+// the natural `a<b?a:b` form since integers have no NaN.
 #define DECLARE_FLOAT_OPS(T) \
 inline CUDA_CALLABLE T mul(T a, T b) { return a*b; } \
 inline CUDA_CALLABLE T add(T a, T b) { return a+b; } \
 inline CUDA_CALLABLE T sub(T a, T b) { return a-b; } \
-inline CUDA_CALLABLE T min(T a, T b) { return a<b?a:b; } \
-inline CUDA_CALLABLE T max(T a, T b) { return a>b?a:b; } \
+inline CUDA_CALLABLE T min(T a, T b) { return _wp_native_fmin(a, b); } \
+inline CUDA_CALLABLE T max(T a, T b) { return _wp_native_fmax(a, b); } \
 inline CUDA_CALLABLE T sign(T x) { return x < T(0) ? -1 : 1; } \
 inline CUDA_CALLABLE T step(T x) { return x < T(0) ? T(1) : T(0); }\
 inline CUDA_CALLABLE T nonzero(T x) { return x == T(0) ? T(0) : T(1); }\
-inline CUDA_CALLABLE T clamp(T x, T a, T b) { return min(max(a, x), b); }\
+inline CUDA_CALLABLE T clamp(T x, T a, T b) { return _wp_native_fmin(_wp_native_fmax(a, x), b); }\
 inline CUDA_CALLABLE void adj_abs(T x, T& adj_x, T adj_ret) \
 {\
     if (x < T(0))\
@@ -764,31 +854,67 @@ inline CUDA_CALLABLE void adj_add(T a, T b, T& adj_a, T& adj_b, T adj_ret) { adj
 inline CUDA_CALLABLE void adj_sub(T a, T b, T& adj_a, T& adj_b, T adj_ret) { adj_a += adj_ret; adj_b -= adj_ret; } \
 inline CUDA_CALLABLE void adj_min(T a, T b, T& adj_a, T& adj_b, T adj_ret) \
 { \
-    if (a < b) \
+    /* Forward returns: NaN if both NaN; the non-NaN if exactly one is NaN; */ \
+    /* the smaller otherwise. Route gradient to the operand the forward picked. */ \
+    if (::isnan(float(a))) \
+        adj_b += adj_ret; \
+    else if (::isnan(float(b))) \
+        adj_a += adj_ret; \
+    else if (a < b) \
         adj_a += adj_ret; \
     else \
         adj_b += adj_ret; \
 } \
 inline CUDA_CALLABLE void adj_max(T a, T b, T& adj_a, T& adj_b, T adj_ret) \
 { \
-    if (a > b) \
+    if (::isnan(float(a))) \
+        adj_b += adj_ret; \
+    else if (::isnan(float(b))) \
+        adj_a += adj_ret; \
+    else if (a > b) \
         adj_a += adj_ret; \
     else \
         adj_b += adj_ret; \
 } \
-inline CUDA_CALLABLE void adj_floordiv(T a, T b, T& adj_a, T& adj_b, T adj_ret) { } \
+inline CUDA_CALLABLE void adj_floordiv(T a, T b, T& adj_a, T& adj_b, T adj_ret) \
+{ \
+    /* MISSINGADJOINT: gradient is zero almost everywhere (subgradient at integer points) */ \
+} \
 inline CUDA_CALLABLE void adj_mod(T a, T b, T& adj_a, T& adj_b, T adj_ret){ adj_a += adj_ret; }\
-inline CUDA_CALLABLE void adj_sign(T x, T adj_x, T& adj_ret) { }\
-inline CUDA_CALLABLE void adj_step(T x, T& adj_x, T adj_ret) { }\
-inline CUDA_CALLABLE void adj_nonzero(T x, T& adj_x, T adj_ret) { }\
+inline CUDA_CALLABLE void adj_sign(T x, T adj_x, T& adj_ret) \
+{ \
+    /* MISSINGADJOINT: gradient is zero almost everywhere (subgradient at x = 0) */ \
+}\
+inline CUDA_CALLABLE void adj_copysign(T x, T y, T& adj_x, T& adj_y, T adj_ret) \
+{ \
+    /* copysign(x, y) = |x| * sign(y). d/dx is +1 when signs of x and y agree, */ \
+    /* -1 otherwise. d/dy is 0 almost everywhere -- the result depends on y    */ \
+    /* only through its sign, which is locally constant for y != 0.            */ \
+    /* Use copysign(1, .) so signed-zero inputs are classified by their sign   */ \
+    /* bit (x < 0 is false for both +0 and -0).                                */ \
+    if (copysign(T(1), x) == copysign(T(1), y)) \
+        adj_x += adj_ret; \
+    else \
+        adj_x -= adj_ret; \
+} \
+inline CUDA_CALLABLE void adj_step(T x, T& adj_x, T adj_ret) \
+{ \
+    /* MISSINGADJOINT: gradient is zero almost everywhere (subgradient at x = 0) */ \
+}\
+inline CUDA_CALLABLE void adj_nonzero(T x, T& adj_x, T adj_ret) \
+{ \
+    /* MISSINGADJOINT: gradient is zero almost everywhere (subgradient at x = 0) */ \
+}\
 inline CUDA_CALLABLE void adj_clamp(T x, T a, T b, T& adj_x, T& adj_a, T& adj_b, T adj_ret)\
 {\
-    if (x < a)\
-        adj_a += adj_ret;\
-    else if (x > b)\
-        adj_b += adj_ret;\
-    else\
-        adj_x += adj_ret;\
+    /* Forward expands to fmin(fmax(a, x), b). Apply the chain rule via the */ \
+    /* already-correct adj_min / adj_max: their routing handles every NaN   */ \
+    /* combination consistently (e.g. when x is NaN the output equals       */ \
+    /* fmin(a, b) and the gradient flows to whichever bound won).           */ \
+    T m = max(a, x); \
+    T adj_m = T(0); \
+    adj_min(m, b, adj_m, adj_b, adj_ret); \
+    adj_max(a, x, adj_a, adj_x, adj_m); \
 }\
 inline CUDA_CALLABLE T div(T a, T b)\
 {\
@@ -810,10 +936,35 @@ inline CUDA_CALLABLE void adj_div(T a, T b, T ret, T& adj_a, T& adj_b, T adj_ret
         printf("%s:%d - adj_div(%f, %f, %f, %f, %f)\n", __FILE__, __LINE__, float(a), float(b), float(adj_a), float(adj_b), float(adj_ret));\
         assert(0);\
     })\
-}\
-inline CUDA_CALLABLE void adj_isnan(const T&, T&, bool) { }\
-inline CUDA_CALLABLE void adj_isinf(const T&, T&, bool) { }\
-inline CUDA_CALLABLE void adj_isfinite(const T&, T&, bool) { }
+}
+
+// copysign(x, y) returns x with the sign bit of y. Lowers to a single
+// instruction on CUDA (libdevice __nv_copysign) and on Clang/GCC (compiler
+// intrinsic). MSVC (warp.dll host build only) falls through to ::copysignf,
+// which is declared by <math.h> via crt.h. half / bfloat16 round-trip through
+// float; the magnitude bits are exactly representable in the original type so
+// the cast back is exact. Defined ahead of DECLARE_FLOAT_OPS instantiations
+// because adj_copysign uses it for sign-bit-aware comparison.
+inline CUDA_CALLABLE float copysign(float x, float y)
+{
+#if !defined(__CUDA_ARCH__) && (defined(__GNUC__) || defined(__clang__))
+    return __builtin_copysignf(x, y);
+#else
+    return ::copysignf(x, y);
+#endif
+}
+inline CUDA_CALLABLE double copysign(double x, double y)
+{
+#if !defined(__CUDA_ARCH__) && (defined(__GNUC__) || defined(__clang__))
+    return __builtin_copysign(x, y);
+#else
+    return ::copysign(x, y);
+#endif
+}
+inline CUDA_CALLABLE half copysign(half x, half y) { return half(copysign(float(x), float(y))); }
+#ifndef WP_NO_BFLOAT16
+inline CUDA_CALLABLE bfloat16 copysign(bfloat16 x, bfloat16 y) { return bfloat16(copysign(float(x), float(y))); }
+#endif
 
 DECLARE_FLOAT_OPS(float16)
 #ifndef WP_NO_BFLOAT16
@@ -1688,12 +1839,30 @@ inline CUDA_CALLABLE void adj_radians(T x, T& adj_x, T adj_ret)\
 {\
     adj_x += T(DEG_TO_RAD) * adj_ret;\
 }\
-inline CUDA_CALLABLE void adj_round(T x, T& adj_x, T adj_ret){ }\
-inline CUDA_CALLABLE void adj_rint(T x, T& adj_x, T adj_ret){ }\
-inline CUDA_CALLABLE void adj_trunc(T x, T& adj_x, T adj_ret){ }\
-inline CUDA_CALLABLE void adj_floor(T x, T& adj_x, T adj_ret){ }\
-inline CUDA_CALLABLE void adj_ceil(T x, T& adj_x, T adj_ret){ }\
-inline CUDA_CALLABLE void adj_frac(T x, T& adj_x, T adj_ret){ }
+inline CUDA_CALLABLE void adj_round(T x, T& adj_x, T adj_ret) \
+{ \
+    /* MISSINGADJOINT: gradient is zero almost everywhere (subgradient at half-integer points) */ \
+}\
+inline CUDA_CALLABLE void adj_rint(T x, T& adj_x, T adj_ret) \
+{ \
+    /* MISSINGADJOINT: gradient is zero almost everywhere (subgradient at half-integer points) */ \
+}\
+inline CUDA_CALLABLE void adj_trunc(T x, T& adj_x, T adj_ret) \
+{ \
+    /* MISSINGADJOINT: gradient is zero almost everywhere (subgradient at integer points) */ \
+}\
+inline CUDA_CALLABLE void adj_floor(T x, T& adj_x, T adj_ret) \
+{ \
+    /* MISSINGADJOINT: gradient is zero almost everywhere (subgradient at integer points) */ \
+}\
+inline CUDA_CALLABLE void adj_ceil(T x, T& adj_x, T adj_ret) \
+{ \
+    /* MISSINGADJOINT: gradient is zero almost everywhere (subgradient at integer points) */ \
+}\
+inline CUDA_CALLABLE void adj_frac(T x, T& adj_x, T adj_ret) \
+{ \
+    /* MISSINGADJOINT: gradient is 1 between integers (subgradient at integer points) */ \
+}
 
 DECLARE_ADJOINTS(float16)
 #ifndef WP_NO_BFLOAT16
@@ -1793,14 +1962,15 @@ template <typename T> CUDA_CALLABLE inline void adj_neg(const T& x, T& adj_x, co
 
 // unary boolean negation
 template <typename T> CUDA_CALLABLE inline bool unot(const T& b) { return !b; }
-template <typename T> CUDA_CALLABLE inline void adj_unot(const T& b, T& adj_b, const bool& adj_ret) { }
 
-const int LAUNCH_MAX_DIMS = 4;  // should match types.py
+static constexpr int LAUNCH_MAX_DIMS = 4;  // should match types.py
 
-struct launch_bounds_t {
-    int shape[LAUNCH_MAX_DIMS];  // size of each dimension
-    int ndim;  // number of valid dimension
-    size_t size;  // total number of threads
+template <int N> struct launch_bounds_t {
+    static_assert(N > 0 && N <= LAUNCH_MAX_DIMS, "launch_bounds_t<N> only supports 1-4 dimensions");
+
+    int shape[N];
+    size_t size;
+    size_t coord_mult;  // threads sharing each coord tuple; launch_coord divides linear by this before unraveling
 };
 
 // represents coordinate in the launch grid
@@ -1812,26 +1982,29 @@ struct launch_coord_t {
 };
 
 // unravels a linear thread index to the corresponding launch grid coord (up to 4d)
-inline CUDA_CALLABLE launch_coord_t launch_coord(size_t linear, const launch_bounds_t& bounds)
+template <int N> inline CUDA_CALLABLE launch_coord_t launch_coord(size_t linear, const launch_bounds_t<N>& bounds)
 {
     launch_coord_t coord = { 0, 0, 0, 0 };
 
-    if (bounds.ndim > 3) {
+    if (bounds.coord_mult > 1)
+        linear /= bounds.coord_mult;
+
+    if constexpr (N > 3) {
         coord.l = linear % bounds.shape[3];
         linear /= bounds.shape[3];
     }
 
-    if (bounds.ndim > 2) {
+    if constexpr (N > 2) {
         coord.k = linear % bounds.shape[2];
         linear /= bounds.shape[2];
     }
 
-    if (bounds.ndim > 1) {
+    if constexpr (N > 1) {
         coord.j = linear % bounds.shape[1];
         linear /= bounds.shape[1];
     }
 
-    if (bounds.ndim > 0) {
+    if constexpr (N > 0) {
         coord.i = linear;
     }
 
@@ -1847,42 +2020,36 @@ inline CUDA_CALLABLE int block_dim()
 #endif
 }
 
-inline CUDA_CALLABLE int tid(size_t index, const launch_bounds_t& bounds)
+template <int N> inline CUDA_CALLABLE int tid(size_t index, const launch_bounds_t<N>& bounds)
 {
-    // For the 1-D tid() we need to warn the user if we're about to provide a truncated index
-    // Only do this in _DEBUG when called from device to avoid excessive register allocation
-#if defined(_DEBUG) || (!defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__))
-    if (index > 2147483647) {
-        printf("Warp warning: tid() is returning an overflowed int\n");
-    }
-#endif
-
-    launch_coord_t c = launch_coord(index, bounds);
-    return static_cast<int>(c.i);
+    launch_coord_t coord = launch_coord(index, bounds);
+    return static_cast<int>(coord.i);
 }
 
-inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, size_t index, const launch_bounds_t& bounds)
+template <int N> inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, size_t index, const launch_bounds_t<N>& bounds)
 {
-    launch_coord_t c = launch_coord(index, bounds);
-    i = c.i;
-    j = c.j;
+    launch_coord_t coord = launch_coord(index, bounds);
+    i = coord.i;
+    j = coord.j;
 }
 
-inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, int& k, size_t index, const launch_bounds_t& bounds)
+template <int N>
+inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, int& k, size_t index, const launch_bounds_t<N>& bounds)
 {
-    launch_coord_t c = launch_coord(index, bounds);
-    i = c.i;
-    j = c.j;
-    k = c.k;
+    launch_coord_t coord = launch_coord(index, bounds);
+    i = coord.i;
+    j = coord.j;
+    k = coord.k;
 }
 
-inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, int& k, int& l, size_t index, const launch_bounds_t& bounds)
+template <int N>
+inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, int& k, int& l, size_t index, const launch_bounds_t<N>& bounds)
 {
-    launch_coord_t c = launch_coord(index, bounds);
-    i = c.i;
-    j = c.j;
-    k = c.k;
-    l = c.l;
+    launch_coord_t coord = launch_coord(index, bounds);
+    i = coord.i;
+    j = coord.j;
+    k = coord.k;
+    l = coord.l;
 }
 
 // should match types.py
@@ -1909,14 +2076,26 @@ struct slice_t {
     }
 };
 
+CUDA_CALLABLE inline void slice_assert_step_nonzero(const slice_t& slice)
+{
+    if (slice.step != 0) {
+        return;
+    }
+
+#if defined(__CUDA_ARCH__)
+    printf("slice step cannot be zero\n");
+    __trap();
+#elif defined(__HIP_DEVICE_COMPILE__)
+    printf("slice step cannot be zero\n");
+    __builtin_trap();
+#else
+    _wp_assert("slice step cannot be zero", __FILE__, unsigned(__LINE__));
+#endif
+}
+
 CUDA_CALLABLE inline slice_t slice_adjust_indices(const slice_t& slice, int length)
 {
-#ifndef NDEBUG
-    if (slice.step == 0) {
-        printf("%s:%d slice step cannot be 0\n", __FILE__, __LINE__);
-        assert(0);
-    }
-#endif
+    slice_assert_step_nonzero(slice);
 
     int start, stop;
 
@@ -1937,15 +2116,8 @@ CUDA_CALLABLE inline slice_t slice_adjust_indices(const slice_t& slice, int leng
     return { start, stop, slice.step };
 }
 
-CUDA_CALLABLE inline int slice_get_length(const slice_t& slice)
+CUDA_CALLABLE inline int slice_get_length_unchecked(const slice_t& slice)
 {
-#ifndef NDEBUG
-    if (slice.step == 0) {
-        printf("%s:%d slice step cannot be 0\n", __FILE__, __LINE__);
-        assert(0);
-    }
-#endif
-
     if (slice.step > 0 && slice.start < slice.stop) {
         return 1 + (slice.stop - slice.start - 1) / slice.step;
     }
@@ -1955,6 +2127,12 @@ CUDA_CALLABLE inline int slice_get_length(const slice_t& slice)
     }
 
     return 0;
+}
+
+CUDA_CALLABLE inline int slice_get_length(const slice_t& slice)
+{
+    slice_assert_step_nonzero(slice);
+    return slice_get_length_unchecked(slice);
 }
 
 template <typename T> inline CUDA_CALLABLE T atomic_add(T* buf, T value)
@@ -2026,10 +2204,29 @@ template <> inline CUDA_CALLABLE float16 atomic_add(float16* buf, float16 value)
 #ifndef WP_NO_BFLOAT16
 template <> inline CUDA_CALLABLE bfloat16 atomic_add(bfloat16* buf, bfloat16 value)
 {
-#if !defined(__CUDA_ARCH__)
+#if !defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
     bfloat16 old = buf[0];
     buf[0] += value;
     return old;
+#elif defined(__HIP_DEVICE_COMPILE__)
+    // CAS loop on the naturally aligned 32-bit word containing the 16-bit value
+    // (portable across gfx9/gfx11; no native bf16 atomic add on RDNA3).
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(buf);
+    unsigned int* word = reinterpret_cast<unsigned int*>(addr & ~uintptr_t(3));
+    const unsigned int shift = (addr & 2) ? 16u : 0u;
+    unsigned int old_word = *word;
+    unsigned int assumed;
+    do {
+        assumed = old_word;
+        bfloat16 old_bf16;
+        old_bf16.u = static_cast<unsigned short>(assumed >> shift);
+        bfloat16 new_bf16 = float_to_bfloat16(bfloat16_to_float(old_bf16) + bfloat16_to_float(value));
+        const unsigned int new_word = (assumed & ~(0xffffu << shift)) | (static_cast<unsigned int>(new_bf16.u) << shift);
+        old_word = atomicCAS(word, assumed, new_word);
+    } while (assumed != old_word);
+    bfloat16 result;
+    result.u = static_cast<unsigned short>(old_word >> shift);
+    return result;
 #elif __CUDA_ARCH__ >= 900
     bfloat16 old;
     asm volatile("atom.add.noftz.bf16 %0, [%1], %2;" : "=h"(old.u) : "l"(buf), "h"(value.u) : "memory");
@@ -2099,6 +2296,15 @@ template <typename T> inline CUDA_CALLABLE T atomic_min(T* address, T val)
 }
 
 // emulate atomic float min with atomicCAS()
+//
+// The in-loop `if (min_as_i == assumed)` short-circuit is the only early-out:
+// it skips the CAS when `min(assumed, val)` would not change the stored bits.
+// This is a perf-only optimization; correctness comes from the CAS loop
+// itself. Note this is bit-equal, not semantic: when both `assumed` and
+// `val` are NaN with different payloads, fmin returns one of them and the
+// CAS proceeds -- the stored payload changes, but the value stays NaN.
+// Loop termination is unaffected because the next iteration's `assumed`
+// matches the just-written bits.
 template <> inline CUDA_CALLABLE float atomic_min(float* address, float val)
 {
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
@@ -2107,13 +2313,13 @@ template <> inline CUDA_CALLABLE float atomic_min(float* address, float val)
     int old = *address_as_i;
     int assumed;
 
-    if (val < __int_as_float(old)) {
-        do {
-            assumed = old;
-            int min_as_i = __float_as_int(min(__int_as_float(assumed), val));
-            old = atomicCAS(address_as_i, assumed, min_as_i);
-        } while (assumed != old);
-    }
+    do {
+        assumed = old;
+        int min_as_i = __float_as_int(min(__int_as_float(assumed), val));
+        if (min_as_i == assumed)
+            return __int_as_float(old);
+        old = atomicCAS(address_as_i, assumed, min_as_i);
+    } while (assumed != old);
 
     return __int_as_float(old);
 
@@ -2133,13 +2339,13 @@ template <> inline CUDA_CALLABLE double atomic_min(double* address, double val)
     unsigned long long old = *address_as_ull;
     unsigned long long assumed;
 
-    if (val < __longlong_as_double(old)) {
-        do {
-            assumed = old;
-            unsigned long long min_as_ull = __double_as_longlong(min(__longlong_as_double(assumed), val));
-            old = atomicCAS(address_as_ull, assumed, min_as_ull);
-        } while (assumed != old);
-    }
+    do {
+        assumed = old;
+        unsigned long long min_as_ull = __double_as_longlong(min(__longlong_as_double(assumed), val));
+        if (min_as_ull == assumed)
+            return __longlong_as_double(old);
+        old = atomicCAS(address_as_ull, assumed, min_as_ull);
+    } while (assumed != old);
 
     return __longlong_as_double(old);
 
@@ -2182,15 +2388,17 @@ template <> inline CUDA_CALLABLE bfloat16 atomic_min(bfloat16* buf, bfloat16 val
 
     float val_f = bfloat16_to_float(val);
     bfloat16 old_bf16;
-    old_bf16.u = old_val;
-    if (val_f < bfloat16_to_float(old_bf16)) {
-        do {
-            assumed = old_val;
-            old_bf16.u = assumed;
-            bfloat16 new_bf16 = float_to_bfloat16(min(bfloat16_to_float(old_bf16), val_f));
-            old_val = atomicCAS(address_as_ushort, assumed, new_bf16.u);
-        } while (assumed != old_val);
-    }
+    do {
+        assumed = old_val;
+        old_bf16.u = assumed;
+        bfloat16 new_bf16 = float_to_bfloat16(min(bfloat16_to_float(old_bf16), val_f));
+        if (new_bf16.u == assumed) {
+            bfloat16 result;
+            result.u = old_val;
+            return result;
+        }
+        old_val = atomicCAS(address_as_ushort, assumed, new_bf16.u);
+    } while (assumed != old_val);
     bfloat16 result;
     result.u = old_val;
     return result;
@@ -2221,13 +2429,13 @@ template <> inline CUDA_CALLABLE float atomic_max(float* address, float val)
     int old = *address_as_i;
     int assumed;
 
-    if (val > __int_as_float(old)) {
-        do {
-            assumed = old;
-            int max_as_i = __float_as_int(max(__int_as_float(assumed), val));
-            old = atomicCAS(address_as_i, assumed, max_as_i);
-        } while (assumed != old);
-    }
+    do {
+        assumed = old;
+        int max_as_i = __float_as_int(max(__int_as_float(assumed), val));
+        if (max_as_i == assumed)
+            return __int_as_float(old);
+        old = atomicCAS(address_as_i, assumed, max_as_i);
+    } while (assumed != old);
 
     return __int_as_float(old);
 
@@ -2247,13 +2455,13 @@ template <> inline CUDA_CALLABLE double atomic_max(double* address, double val)
     unsigned long long old = *address_as_ull;
     unsigned long long assumed;
 
-    if (val > __longlong_as_double(old)) {
-        do {
-            assumed = old;
-            unsigned long long max_as_ull = __double_as_longlong(max(__longlong_as_double(assumed), val));
-            old = atomicCAS(address_as_ull, assumed, max_as_ull);
-        } while (assumed != old);
-    }
+    do {
+        assumed = old;
+        unsigned long long max_as_ull = __double_as_longlong(max(__longlong_as_double(assumed), val));
+        if (max_as_ull == assumed)
+            return __longlong_as_double(old);
+        old = atomicCAS(address_as_ull, assumed, max_as_ull);
+    } while (assumed != old);
 
     return __longlong_as_double(old);
 
@@ -2296,15 +2504,17 @@ template <> inline CUDA_CALLABLE bfloat16 atomic_max(bfloat16* buf, bfloat16 val
 
     float val_f = bfloat16_to_float(val);
     bfloat16 old_bf16;
-    old_bf16.u = old_val;
-    if (val_f > bfloat16_to_float(old_bf16)) {
-        do {
-            assumed = old_val;
-            old_bf16.u = assumed;
-            bfloat16 new_bf16 = float_to_bfloat16(max(bfloat16_to_float(old_bf16), val_f));
-            old_val = atomicCAS(address_as_ushort, assumed, new_bf16.u);
-        } while (assumed != old_val);
-    }
+    do {
+        assumed = old_val;
+        old_bf16.u = assumed;
+        bfloat16 new_bf16 = float_to_bfloat16(max(bfloat16_to_float(old_bf16), val_f));
+        if (new_bf16.u == assumed) {
+            bfloat16 result;
+            result.u = old_val;
+            return result;
+        }
+        old_val = atomicCAS(address_as_ushort, assumed, new_bf16.u);
+    } while (assumed != old_val);
     bfloat16 result;
     result.u = old_val;
     return result;
@@ -2315,23 +2525,20 @@ template <> inline CUDA_CALLABLE bfloat16 atomic_max(bfloat16* buf, bfloat16 val
 }
 #endif  // WP_NO_BFLOAT16
 
-// default behavior for adjoint of atomic min/max operation that accumulates gradients for all elements matching the
-// min/max value
+// Adjoint of atomic min/max: accumulate gradient for each thread whose `value`
+// matched the slot the forward operator wrote. The standard equality test
+// catches the finite cases; the explicit both-NaN branch covers the case
+// where the forward CAS replaced an old NaN with `value`'s NaN payload,
+// which `value == *addr` cannot detect (NaN != NaN).
+//
+// Integer overloads are no-ops, generated by DECLARE_INT_OPS. The bool
+// overload is also a no-op.
 template <typename T> CUDA_CALLABLE inline void adj_atomic_minmax(T* addr, T* adj_addr, const T& value, T& adj_value)
 {
-    if (value == *addr)
+    if (value == *addr || (::isnan(float(value)) && ::isnan(float(*addr))))
         adj_value += *adj_addr;
 }
 
-// for integral types we do not accumulate gradients
-CUDA_CALLABLE inline void adj_atomic_minmax(int8* buf, int8* adj_buf, const int8& value, int8& adj_value) { }
-CUDA_CALLABLE inline void adj_atomic_minmax(uint8* buf, uint8* adj_buf, const uint8& value, uint8& adj_value) { }
-CUDA_CALLABLE inline void adj_atomic_minmax(int16* buf, int16* adj_buf, const int16& value, int16& adj_value) { }
-CUDA_CALLABLE inline void adj_atomic_minmax(uint16* buf, uint16* adj_buf, const uint16& value, uint16& adj_value) { }
-CUDA_CALLABLE inline void adj_atomic_minmax(int32* buf, int32* adj_buf, const int32& value, int32& adj_value) { }
-CUDA_CALLABLE inline void adj_atomic_minmax(uint32* buf, uint32* adj_buf, const uint32& value, uint32& adj_value) { }
-CUDA_CALLABLE inline void adj_atomic_minmax(int64* buf, int64* adj_buf, const int64& value, int64& adj_value) { }
-CUDA_CALLABLE inline void adj_atomic_minmax(uint64* buf, uint64* adj_buf, const uint64& value, uint64& adj_value) { }
 CUDA_CALLABLE inline void adj_atomic_minmax(bool* buf, bool* adj_buf, const bool& value, bool& adj_value) { }
 
 
@@ -2351,11 +2558,10 @@ template <typename T> inline CUDA_CALLABLE T atomic_cas(T* address, T compare, T
 template <> inline CUDA_CALLABLE float atomic_cas(float* address, float compare, float val)
 {
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
-    auto result = atomicCAS(
-        reinterpret_cast<unsigned int*>(address), reinterpret_cast<unsigned int&>(compare),
-        reinterpret_cast<unsigned int&>(val)
-    );
-    return reinterpret_cast<float&>(result);
+    unsigned int compare_bits = __float_as_uint(compare);
+    unsigned int val_bits = __float_as_uint(val);
+    auto result = atomicCAS(reinterpret_cast<unsigned int*>(address), compare_bits, val_bits);
+    return __uint_as_float(result);
 #else
     float old = *address;
     if (old == compare) {
@@ -2368,11 +2574,10 @@ template <> inline CUDA_CALLABLE float atomic_cas(float* address, float compare,
 template <> inline CUDA_CALLABLE double atomic_cas(double* address, double compare, double val)
 {
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
-    auto result = atomicCAS(
-        reinterpret_cast<unsigned long long int*>(address), reinterpret_cast<unsigned long long int&>(compare),
-        reinterpret_cast<unsigned long long int&>(val)
-    );
-    return reinterpret_cast<double&>(result);
+    unsigned long long int compare_bits = static_cast<unsigned long long int>(__double_as_longlong(compare));
+    unsigned long long int val_bits = static_cast<unsigned long long int>(__double_as_longlong(val));
+    auto result = atomicCAS(reinterpret_cast<unsigned long long int*>(address), compare_bits, val_bits);
+    return __longlong_as_double(static_cast<long long int>(result));
 #else
     double old = *address;
     if (old == compare) {
@@ -2386,10 +2591,10 @@ template <> inline CUDA_CALLABLE int64 atomic_cas(int64* address, int64 compare,
 {
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
     auto result = atomicCAS(
-        reinterpret_cast<unsigned long long int*>(address), reinterpret_cast<unsigned long long int&>(compare),
-        reinterpret_cast<unsigned long long int&>(val)
+        reinterpret_cast<unsigned long long int*>(address), static_cast<unsigned long long int>(compare),
+        static_cast<unsigned long long int>(val)
     );
-    return reinterpret_cast<int64&>(result);
+    return static_cast<int64>(result);
 #else
     int64 old = *address;
     if (old == compare) {
@@ -2413,10 +2618,9 @@ template <typename T> inline CUDA_CALLABLE T atomic_exch(T* address, T val)
 template <> inline CUDA_CALLABLE double atomic_exch(double* address, double val)
 {
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
-    auto result = atomicExch(
-        reinterpret_cast<unsigned long long int*>(address), reinterpret_cast<unsigned long long int&>(val)
-    );
-    return reinterpret_cast<double&>(result);
+    unsigned long long int val_bits = static_cast<unsigned long long int>(__double_as_longlong(val));
+    auto result = atomicExch(reinterpret_cast<unsigned long long int*>(address), val_bits);
+    return __longlong_as_double(static_cast<long long int>(result));
 #else
     double old = *address;
     *address = val;
@@ -2427,10 +2631,9 @@ template <> inline CUDA_CALLABLE double atomic_exch(double* address, double val)
 template <> inline CUDA_CALLABLE int64 atomic_exch(int64* address, int64 val)
 {
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
-    auto result = atomicExch(
-        reinterpret_cast<unsigned long long int*>(address), reinterpret_cast<unsigned long long int&>(val)
-    );
-    return reinterpret_cast<int64&>(result);
+    auto result
+        = atomicExch(reinterpret_cast<unsigned long long int*>(address), static_cast<unsigned long long int>(val));
+    return static_cast<int64>(result);
 #else
     int64 old = *address;
     *address = val;
@@ -2487,25 +2690,8 @@ template <typename T> inline CUDA_CALLABLE T atomic_xor(T* buf, T value)
 }
 
 
-// for bitwise operations we do not accumulate gradients
-template <typename T> CUDA_CALLABLE inline void adj_atomic_and(T* buf, T* adj_buf, T& value, T& adj_value) { }
-template <typename T> CUDA_CALLABLE inline void adj_atomic_or(T* buf, T* adj_buf, T& value, T& adj_value) { }
-template <typename T> CUDA_CALLABLE inline void adj_atomic_xor(T* buf, T* adj_buf, T& value, T& adj_value) { }
-
-
 }  // namespace wp
 
-
-// bool and printf are defined outside of the wp namespace in crt.h, hence
-// their adjoint counterparts are also defined in the global namespace.
-template <typename T> CUDA_CALLABLE inline void adj_bool(T, T&, bool) { }
-// Variadic functions are not supported in CUDA device code when compiled with Clang.
-// Since adj_printf is a no-op, we use a template overload to accept and ignore any arguments.
-#if defined(__clang__) && defined(__CUDA__)
-template <typename... Args> inline CUDA_CALLABLE void adj_printf(const char* fmt, Args...) { }
-#else
-inline CUDA_CALLABLE void adj_printf(const char* fmt, ...) { }
-#endif
 
 // clang-format off
 // These includes must remain in this order due to dependencies
@@ -2514,7 +2700,6 @@ inline CUDA_CALLABLE void adj_printf(const char* fmt, ...) { }
 #include "quat.h"
 #include "spatial.h"
 #include "intersect.h"
-#include "intersect_adj.h"
 // clang-format on
 
 //--------------
@@ -2528,6 +2713,7 @@ inline CUDA_CALLABLE void adj_dot(float a, float b, float& adj_a, float& adj_b, 
     adj_mul(a, b, adj_a, adj_b, adj_ret);
 }
 inline CUDA_CALLABLE float tensordot(float a, float b) { return mul(a, b); }
+template <typename T> inline CUDA_CALLABLE T tensordot(T a, T b) { return mul(a, b); }
 
 
 #define DECLARE_INTERP_FUNCS(T) \
@@ -2703,11 +2889,6 @@ template <typename T> inline CUDA_CALLABLE void expect_eq(const T& actual, const
     }
 }
 
-template <typename T> inline CUDA_CALLABLE void adj_expect_eq(const T& a, const T& b, T& adj_a, T& adj_b)
-{
-    // nop
-}
-
 template <typename T> inline CUDA_CALLABLE void expect_neq(const T& actual, const T& expected)
 {
     if (actual == expected) {
@@ -2717,11 +2898,6 @@ template <typename T> inline CUDA_CALLABLE void expect_neq(const T& actual, cons
         printf("\t Actual: ");
         print(actual);
     }
-}
-
-template <typename T> inline CUDA_CALLABLE void adj_expect_neq(const T& a, const T& b, T& adj_a, T& adj_b)
-{
-    // nop
 }
 
 template <typename T> inline CUDA_CALLABLE void expect_near(const T& actual, const T& expected, const T& tolerance)
@@ -2754,22 +2930,6 @@ inline CUDA_CALLABLE void expect_near(const vec3& actual, const vec3& expected, 
     }
 }
 
-template <typename T>
-inline CUDA_CALLABLE void adj_expect_near(
-    const T& actual, const T& expected, const T& tolerance, T& adj_actual, T& adj_expected, T& adj_tolerance
-)
-{
-    // nop
-}
-
-inline CUDA_CALLABLE void adj_expect_near(
-    const vec3& actual, const vec3& expected, float tolerance, vec3& adj_actual, vec3& adj_expected, float adj_tolerance
-)
-{
-    // nop
-}
-
-
 }  // namespace wp
 
 // clang-format off
@@ -2787,7 +2947,15 @@ inline CUDA_CALLABLE void adj_expect_near(
 #include "noise.h"
 #include "matnn.h"
 #include "tile.h"
+#include "tile_matmul.h"
+#include "tile_solve.h"
+#include "tile_cholesky.h"
 #include "tile_reduce.h"
 #include "tile_scan.h"
 #include "tile_radix_sort.h"
 // clang-format on
+
+#if defined(WP_HIP_HOST_DEVICE_REGION)
+#pragma clang force_cuda_host_device end
+#undef WP_HIP_HOST_DEVICE_REGION
+#endif

@@ -208,9 +208,45 @@ alive until all arrays allocated through it are garbage-collected.
 The native allocation tracker (added in [GH-1269](https://github.com/NVIDIA/warp/issues/1269))
 only records allocations that flow through the `wp_alloc_*` / `wp_free_*` entry points.
 Custom allocators bypass those, so allocations made via `set_cuda_allocator` /
-`set_device_allocator` do not appear in tracker reports. A follow-up change will
-introduce a richer allocator protocol that lets custom allocators participate in
-tracking without leaking framework internals into the allocator surface.
+`set_device_allocator` do not appear in tracker reports. Future allocator tracking
+support needs to let custom allocators participate without leaking framework
+internals into the allocator surface.
+
+#### Launch Verification Interaction
+
+Current limitation: `wp.can_access(device, array)` and
+`warp.config.launch_array_access_mode = wp.config.LaunchArrayAccessMode.CHECKED`
+remain conservative for arrays allocated through custom allocators when Warp
+cannot classify the pointer or prove the relevant access state.
+Same-device launches are accepted, but cross-device launches require Warp to
+know whether the allocation uses default CUDA memory, CUDA memory pools,
+pinned host memory, managed memory, or another memory type. CUDA pointer
+attributes can classify externally wrapped managed and ordinary CUDA device
+pointers so Warp can use managed-memory or peer-access predicates. The current
+custom allocator protocol still only returns a pointer, so unclassified
+pointers and externally wrapped or custom memory-pool pointers whose specific
+pool access state cannot be proven warn once per launch pattern in checked
+mode and then proceed. Using `wp.config.LaunchArrayAccessMode.RELAXED` leaves
+access legality to the hardware without the diagnostic, matching the default
+launch path.
+
+Future solutions must provide enough memory-kind and access metadata for
+`wp.can_access(device, array)` and `wp.config.LaunchArrayAccessMode.CHECKED` to
+make the same conservative decisions they make for Warp-owned allocations. At a
+minimum, Warp needs to distinguish the owning device and memory class for
+allocations that participate in cross-device launch verification, including
+CUDA device memory that is neither managed nor memory-pool memory, CUDA
+memory pools, managed memory, pinned host memory, and allocator-defined
+external memory.
+
+Any future mechanism must remain backward compatible with simple custom
+allocators, preserve an "unknown" result when memory metadata is
+unavailable or unrecognized, and avoid exposing framework-specific internals as
+part of the basic allocator surface. It also needs to keep launch verification
+compatible with CUDA graph capture and use the same access predicates as
+Warp-owned allocations: peer access for default CUDA memory, memory-pool access
+for CUDA pool allocations, and CPU/GPU coherence checks for managed or pinned
+host allocations.
 
 #### Built-in RMM Adapter
 

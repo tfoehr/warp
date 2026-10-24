@@ -14,9 +14,125 @@ setting documentation for details.
 For information on module-level and kernel-level settings, see :doc:`/user_guide/configuration`.
 """
 
-_wp_module_name_ = "warp.config"
+import sys as _sys
+import types as _types
+from enum import IntEnum as _IntEnum
 
-version: str = "1.13.0+rocm.0"
+from warp._src.logger import LOG_INFO as _LOG_INFO
+from warp._src.logger import log_warning as _log_warning
+
+_deprecated_verbose_warning_seen = False
+_deprecated_quiet_warning_seen = False
+_suppress_verbose_log_level_mapping = False
+
+
+def _is_internal_warp_config_access() -> bool:
+    try:
+        # Temporary verbose/quiet migration hook. Frame depth 3 assumes:
+        # _is_internal_warp_config_access -> _warn_deprecated_config_access
+        # -> module __getattribute__/__setattr__ -> caller. Remove this when
+        # verbose/quiet are removed.
+        module_name = _sys._getframe(3).f_globals.get("__name__", "")
+    except ValueError:
+        return False
+    return module_name == "warp" or module_name.startswith("warp.")
+
+
+def _warn_deprecated_config_access(name: str) -> None:
+    global _deprecated_verbose_warning_seen, _deprecated_quiet_warning_seen
+
+    if _is_internal_warp_config_access():
+        return
+
+    if name == "verbose":
+        if _deprecated_verbose_warning_seen:
+            return
+        message = "warp.config.verbose is deprecated; use warp.config.log_level = warp.LOG_DEBUG instead."
+    elif name == "quiet":
+        if _deprecated_quiet_warning_seen:
+            return
+        message = (
+            "warp.config.quiet is deprecated; use warp.config.log_level = warp.LOG_WARNING to suppress the init banner."
+        )
+    else:
+        return
+
+    _log_warning(message, category=DeprecationWarning, stacklevel=3)
+    if name == "verbose":
+        _deprecated_verbose_warning_seen = True
+    else:
+        _deprecated_quiet_warning_seen = True
+
+
+class _ConfigModule(_types.ModuleType):
+    def __getattribute__(self, name):
+        if name in ("verbose", "quiet"):
+            _warn_deprecated_config_access(name)
+        return super().__getattribute__(name)
+
+    def __setattr__(self, name, value):
+        if name in ("verbose", "quiet"):
+            _warn_deprecated_config_access(name)
+        if name == "launch_array_access_mode" and not isinstance(value, LaunchArrayAccessMode):
+            raise ValueError(
+                f"warp.config.launch_array_access_mode must be a warp.config.LaunchArrayAccessMode value, got {value!r}"
+            )
+        if name == "deterministic" and not isinstance(value, DeterministicMode):
+            raise ValueError(f"warp.config.deterministic must be a warp.DeterministicMode value, got {value!r}")
+        super().__setattr__(name, value)
+
+
+def _install_config_module_hooks() -> None:
+    _sys.modules[__name__].__class__ = _ConfigModule
+
+
+class LaunchArrayAccessMode(_IntEnum):
+    """Array-access verification modes for kernel launches."""
+
+    RELAXED = 0
+    """Perform no launch array access checks before launching kernels."""
+
+    CHECKED = 1
+    """Detect cross-device Warp array access issues before launching kernels where possible."""
+
+    STRICT = 2
+    """Require every Warp array argument to be allocated on the launch device."""
+
+
+class DeterministicMode(_IntEnum):
+    """Deterministic execution modes for supported atomic operations."""
+
+    NOT_GUARANTEED = 0
+    """Use normal atomic execution without constraining atomic ordering."""
+
+    RUN_TO_RUN = 1
+    """Produce bit-exact repeated results on the same GPU architecture."""
+
+    GPU_TO_GPU = 2
+    """Use a stronger path intended to preserve results across GPU architectures."""
+
+
+launch_array_access_mode: LaunchArrayAccessMode = LaunchArrayAccessMode.RELAXED
+"""Kernel launch array access verification mode.
+
+``LaunchArrayAccessMode.RELAXED`` performs no launch array access checks and is
+the default. ``LaunchArrayAccessMode.STRICT`` requires every Warp array argument
+to be allocated on the launch device, matching Warp's original behavior.
+``LaunchArrayAccessMode.CHECKED`` raises an error before launch when Warp can
+determine that a cross-device Warp array argument is not accessible from the
+launch device. When Warp cannot verify access because an array uses an unknown
+custom allocator or externally wrapped allocation, checked mode emits a warning
+once for the launch pattern and allows the launch to proceed.
+
+Unlike ``verify_cuda``, this setting can be used during CUDA graph capture
+because checks run before each launch is recorded. For cross-GPU graph capture,
+enable peer or memory-pool access with Warp APIs before capture begins.
+
+Note: Strict and checked modes impact performance.
+"""
+
+
+version: str = "1.17.0+rocm.1"
 """Warp version string"""
 
 verify_fp: bool = False
@@ -71,7 +187,12 @@ This setting can be overridden at the module level by setting the ``"optimizatio
 """
 
 verbose: bool = False
-"""Enable detailed logging during code generation and compilation."""
+"""Enable detailed logging during code generation and compilation.
+
+.. deprecated::
+    Use ``warp.config.log_level = warp.LOG_DEBUG`` instead. Reading or setting
+    this flag emits a ``DeprecationWarning`` for external callers.
+"""
 
 verbose_warnings: bool = False
 """Enable extended warning messages with source location information."""
@@ -79,7 +200,18 @@ verbose_warnings: bool = False
 quiet: bool = False
 """Disable Warp module initialization messages.
 
-Error messages and warnings remain unaffected.
+.. deprecated::
+    Use ``warp.config.log_level = warp.LOG_WARNING`` instead. Reading or setting
+    this flag emits a ``DeprecationWarning`` for external callers.
+"""
+
+log_level: int = _LOG_INFO
+"""Log level threshold for Warp's logging infrastructure.
+
+Messages below this level are suppressed. Use the ``LOG_DEBUG``, ``LOG_INFO``,
+``LOG_WARNING``, and ``LOG_ERROR`` constants from the ``warp`` module.
+
+Default is ``warp.LOG_INFO`` (20).
 """
 
 verify_autograd_array_access: bool = False
@@ -182,6 +314,14 @@ enable_backward: bool = True
 This setting can be overridden at the module level by setting the ``"enable_backward"`` module option.
 """
 
+default_grid_stride: bool = True
+"""Default ``grid_stride`` for kernels that make no explicit choice.
+
+``False`` opts kernels into the lean launch path (no grid-stride loop, lower per-thread overhead and
+register pressure, but ``max_blocks`` cannot be capped). Lowest precedence: a per-kernel
+``@wp.kernel(grid_stride=...)`` argument or the module ``"default_grid_stride"`` option overrides it.
+"""
+
 enable_mathdx_gemm: bool = True
 """Use libmathdx (cuBLASDx) for tile_matmul on GPU when available.
 
@@ -190,6 +330,32 @@ the slow libmathdx LTO compilation at the cost of runtime performance.
 
 This setting can be overridden at the module level by setting the
 ``"enable_mathdx_gemm"`` module option.
+"""
+
+enable_mathdx_solver: bool = True
+"""Use libmathdx (cuSolverDx) for tile solver ops on GPU when available.
+
+Controls all cuSolverDx-backed ops: :func:`tile_cholesky <warp._src.lang.tile_cholesky>`
+(and its adjoint), :func:`tile_cholesky_solve <warp._src.lang.tile_cholesky_solve>`,
+:func:`tile_lower_solve <warp._src.lang.tile_lower_solve>`, and
+:func:`tile_upper_solve <warp._src.lang.tile_upper_solve>`.
+
+When False, these ops fall back to cooperative shared-memory implementations
+that do not require libmathdx, at the cost of runtime performance.
+
+This setting can be overridden at the module level by setting the
+``"enable_mathdx_solver"`` module option.
+"""
+
+enable_mathdx_fft: bool = True
+"""Use libmathdx (cuFFTDx) for :func:`tile_fft <warp._src.lang.tile_fft>` and
+:func:`tile_ifft <warp._src.lang.tile_ifft>` on GPU when available.
+
+When False, these ops use a fallback that supports power-of-two FFT sizes only,
+trading runtime performance for faster kernel compile times.
+
+This setting can be overridden at the module level by setting the
+``"enable_mathdx_fft"`` module option.
 """
 
 cpu_compiler_flags: str | None = None
@@ -218,6 +384,44 @@ enable_graph_capture_module_load_by_default: bool = True
 """Enable automatic module loading before graph capture.
 
 Only affects systems with CUDA driver versions below 12.3.
+"""
+
+hip_conditional_graph_emulation: bool = True
+"""Emulate conditional graph nodes on HIP/ROCm devices.
+
+HIP has no conditional graph nodes. When this setting is ``True``, :func:`warp.capture_if` and
+:func:`warp.capture_while` calls made during graph capture on a HIP device split the capture into
+plain graph segments, and :func:`warp.capture_launch` replays the result as a host-driven program:
+segments are launched as regular graphs and each condition is read back to the host where the
+branch or loop decision is made. :func:`warp.is_conditional_graph_supported` then returns ``True``
+on HIP.
+
+Replaying such a graph synchronizes the launch stream once per evaluated condition, so the host
+blocks until the work preceding each condition has completed. Graphs without conditionals are
+unaffected and replay as a single native graph launch.
+
+When ``False``, conditional graph capture on HIP raises an error, as with older CUDA toolkits.
+"""
+
+hip_graph_retained_allocations: bool = True
+"""Back allocations made during graph capture on HIP/ROCm devices with graph-owned device memory.
+
+HIP graph memory nodes can be invalidated when other graphs are captured, unlike CUDA graph
+allocations, which stay valid at a fixed address for the lifetime of their graph. When this
+setting is ``True``, arrays allocated during a Warp graph capture on a HIP device use regular device
+memory that the captured :class:`warp.Graph` keeps alive until both the graph and the array are
+released. Memory freed within the capture is not reused by later allocations in the same capture.
+"""
+
+hip_conditional_graph_wait: str = "sync"
+"""How the host waits for a condition value while replaying an emulated conditional graph on HIP.
+
+- ``"sync"``: synchronize the launch stream after the condition readback (default).
+- ``"spin"``: poll a pinned host flag written after the condition readback, falling back to a
+  stream synchronization after a short timeout. This can lower the per-condition latency at the
+  cost of a busy CPU core.
+
+See :attr:`hip_conditional_graph_emulation`.
 """
 
 enable_mempools_at_init: bool = True
@@ -291,8 +495,46 @@ the default number of worker threads is determined by this setting. ``0`` means 
 If ``None``, Warp determines the behavior (currently equal to ``min(os.cpu_count(), 4)``).
 """
 
+deterministic: DeterministicMode = DeterministicMode.NOT_GUARANTEED
+"""Determinism guarantee for supported atomic operations.
+
+Accepted values are:
+
+- ``wp.DeterministicMode.NOT_GUARANTEED``: Default behavior.
+- ``wp.DeterministicMode.RUN_TO_RUN``: Bit-exact repeated results on the same GPU
+  architecture.
+- ``wp.DeterministicMode.GPU_TO_GPU``: Stronger cross-GPU reproducibility path.
+
+Set this before module creation/import for it to apply broadly. Existing
+modules can be changed by setting the ``"deterministic"`` module option.
+See :doc:`/user_guide/execution_and_performance/deterministic_execution` for supported patterns,
+performance considerations, and limitations.
+"""
+
+deterministic_max_records: int = 0
+"""Default per-target, per-thread record bound for deterministic atomics.
+
+The default ``0`` uses the code-generated lower bound. Increase this before
+module creation/import when kernels have data-dependent loops or repeated visits
+to the same atomic site that static analysis cannot bound.
+
+Modules can override this by setting the ``"deterministic_max_records"`` module
+option.
+"""
+
+deterministic_debug: bool = False
+"""Enable debug diagnostics for deterministic execution mode.
+
+When enabled, deterministic scatter overflows may emit device-side diagnostics.
+This setting is intended for debugging capacity issues and should remain disabled
+for normal execution, especially when CUDA graph capture is performance-critical.
+"""
+
 _git_commit_hash: str | None = None
 """Git commit hash associated with the Warp installation.
 
 Set automatically by CI, do not modify.
 """
+
+
+_install_config_module_hooks()

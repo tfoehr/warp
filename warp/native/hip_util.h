@@ -231,8 +231,20 @@ static inline hiprtcResult nvrtcGetSupportedArchs(int* archs)
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 #endif  // cudaFuncAttributeMaxDynamicSharedMemorySize
 #ifndef CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
-#define CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES hipFuncAttributeMaxDynamicSharedMemorySize
+#define CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES HIP_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
 #endif  // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+#ifndef CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES
+#define CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES HIP_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES
+#endif  // CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES
+#ifndef CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES
+#define CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES HIP_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES
+#endif  // CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES
+#ifndef CU_FUNC_ATTRIBUTE_NUM_REGS
+#define CU_FUNC_ATTRIBUTE_NUM_REGS HIP_FUNC_ATTRIBUTE_NUM_REGS
+#endif  // CU_FUNC_ATTRIBUTE_NUM_REGS
+#ifndef CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT
+#define CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT HIP_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT
+#endif  // CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT
 #ifndef cudaCpuDeviceId
 #define cudaCpuDeviceId hipCpuDeviceId
 #endif  // cudaCpuDeviceId
@@ -444,7 +456,10 @@ using CUgraphEdgeData = void;
 using CUstreamCaptureStatus = hipStreamCaptureStatus;
 using CUjit_option = int;
 using CUpointer_attribute = hipPointer_attribute;
-using CUfunction_attribute = hipFuncAttribute;
+// The driver-level CU_FUNC_ATTRIBUTE_* enum and HIP_FUNC_ATTRIBUTE_* share the same numbering
+// (e.g. MAX_DYNAMIC_SHARED_SIZE_BYTES == 8), so the getter can pass values straight through.
+// cuFuncSetAttribute_f translates to the runtime hipFuncAttribute enum where needed.
+using CUfunction_attribute = hipFunction_attribute;
 // HIP has no equivalent of the CUDA `CUoccupancyB2DSize` callback (the only HIP
 // equivalents take a fixed `size_t` shared-memory size). Provide a stub typedef
 // so call sites that reference the type compile under HIP; HIP code paths must
@@ -521,6 +536,9 @@ using CUaddress_mode = HIPaddress_mode;
 #ifndef CU_RESOURCE_TYPE_ARRAY
 #define CU_RESOURCE_TYPE_ARRAY HIP_RESOURCE_TYPE_ARRAY
 #endif  // CU_RESOURCE_TYPE_ARRAY
+#ifndef CU_RESOURCE_TYPE_MIPMAPPED_ARRAY
+#define CU_RESOURCE_TYPE_MIPMAPPED_ARRAY HIP_RESOURCE_TYPE_MIPMAPPED_ARRAY
+#endif  // CU_RESOURCE_TYPE_MIPMAPPED_ARRAY
 
 #ifndef CU_MEMORYTYPE_HOST
 #define CU_MEMORYTYPE_HOST hipMemoryTypeHost
@@ -576,3 +594,95 @@ using CUDA_RESOURCE_VIEW_DESC = hipResourceViewDesc;
 #ifndef CU_DEVICE_ATTRIBUTE_IPC_EVENT_SUPPORTED
 #define CU_DEVICE_ATTRIBUTE_IPC_EVENT_SUPPORTED ((CUdevice_attribute)-1)
 #endif  // CU_DEVICE_ATTRIBUTE_IPC_EVENT_SUPPORTED
+
+// --- Additions for Warp 1.17 ---
+
+// Mipmapped texture arrays
+using CUmipmappedArray = hipMipmappedArray_t;
+
+// Stream identifiers
+#ifndef cudaStreamGetId
+#define cudaStreamGetId hipStreamGetId
+#endif  // cudaStreamGetId
+
+// Graph memory node introspection (used by graph allocation queries)
+#ifndef CU_GRAPH_NODE_TYPE_MEM_ALLOC
+#define CU_GRAPH_NODE_TYPE_MEM_ALLOC hipGraphNodeTypeMemAlloc
+#endif  // CU_GRAPH_NODE_TYPE_MEM_ALLOC
+#ifndef CU_GRAPH_NODE_TYPE_MEM_FREE
+#define CU_GRAPH_NODE_TYPE_MEM_FREE hipGraphNodeTypeMemFree
+#endif  // CU_GRAPH_NODE_TYPE_MEM_FREE
+using cudaMemAllocNodeParams = hipMemAllocNodeParams;
+#ifndef cudaGraphMemAllocNodeGetParams
+#define cudaGraphMemAllocNodeGetParams hipGraphMemAllocNodeGetParams
+#endif  // cudaGraphMemAllocNodeGetParams
+#ifndef cudaGraphMemFreeNodeGetParams
+#define cudaGraphMemFreeNodeGetParams hipGraphMemFreeNodeGetParams
+#endif  // cudaGraphMemFreeNodeGetParams
+
+// Thread block clusters are an NVIDIA Hopper+ feature with no AMD equivalent. Only an opaque
+// declaration is provided so that the cuOccupancyMaxActiveClusters_f prototype compiles; the
+// HIP implementation always reports the feature as unsupported.
+struct CUlaunchConfig;
+
+// Managed/pageable memory queries. Note: on APUs such as Strix Halo (gfx1151) the GPU shares
+// system memory with the CPU, so these report true when HMM/XNACK is available.
+#ifndef CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS
+#define CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS hipDeviceAttributePageableMemoryAccess
+#endif  // CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS
+#ifndef CU_DEVICE_ATTRIBUTE_DIRECT_MANAGED_MEM_ACCESS_FROM_HOST
+#define CU_DEVICE_ATTRIBUTE_DIRECT_MANAGED_MEM_ACCESS_FROM_HOST hipDeviceAttributeDirectManagedMemAccessFromHost
+#endif  // CU_DEVICE_ATTRIBUTE_DIRECT_MANAGED_MEM_ACCESS_FROM_HOST
+#ifndef CU_DEVICE_ATTRIBUTE_HOST_NATIVE_ATOMIC_SUPPORTED
+#define CU_DEVICE_ATTRIBUTE_HOST_NATIVE_ATOMIC_SUPPORTED hipDeviceAttributeHostNativeAtomicSupported
+#endif  // CU_DEVICE_ATTRIBUTE_HOST_NATIVE_ATOMIC_SUPPORTED
+#ifndef CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY
+#define CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY hipDeviceAttributeManagedMemory
+#endif  // CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY
+#ifndef CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS
+#define CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS hipDeviceAttributeConcurrentManagedAccess
+#endif  // CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS
+#ifndef CU_POINTER_ATTRIBUTE_IS_MANAGED
+#define CU_POINTER_ATTRIBUTE_IS_MANAGED HIP_POINTER_ATTRIBUTE_IS_MANAGED
+#endif  // CU_POINTER_ATTRIBUTE_IS_MANAGED
+#ifndef CU_POINTER_ATTRIBUTE_MEMORY_TYPE
+#define CU_POINTER_ATTRIBUTE_MEMORY_TYPE HIP_POINTER_ATTRIBUTE_MEMORY_TYPE
+#endif  // CU_POINTER_ATTRIBUTE_MEMORY_TYPE
+#ifndef CU_STREAM_SET_CAPTURE_DEPENDENCIES
+#define CU_STREAM_SET_CAPTURE_DEPENDENCIES hipStreamSetCaptureDependencies
+#endif  // CU_STREAM_SET_CAPTURE_DEPENDENCIES
+#ifndef CUDA_ERROR_INVALID_VALUE
+#define CUDA_ERROR_INVALID_VALUE hipErrorInvalidValue
+#endif  // CUDA_ERROR_INVALID_VALUE
+#ifndef cudaDeviceGetGraphMemAttribute
+#define cudaDeviceGetGraphMemAttribute hipDeviceGetGraphMemAttribute
+#endif  // cudaDeviceGetGraphMemAttribute
+#ifndef cudaGraphMemAttrUsedMemCurrent
+#define cudaGraphMemAttrUsedMemCurrent hipGraphMemAttrUsedMemCurrent
+#endif  // cudaGraphMemAttrUsedMemCurrent
+#ifndef cudaDeviceGraphMemTrim
+#define cudaDeviceGraphMemTrim hipDeviceGraphMemTrim
+#endif  // cudaDeviceGraphMemTrim
+#ifndef cudaStreamGetFlags
+#define cudaStreamGetFlags hipStreamGetFlags
+#endif  // cudaStreamGetFlags
+#ifndef cudaStreamNonBlocking
+#define cudaStreamNonBlocking hipStreamNonBlocking
+#endif  // cudaStreamNonBlocking
+#ifndef cudaThreadExchangeStreamCaptureMode
+#define cudaThreadExchangeStreamCaptureMode hipThreadExchangeStreamCaptureMode
+#endif  // cudaThreadExchangeStreamCaptureMode
+#ifndef cudaStreamCaptureModeGlobal
+#define cudaStreamCaptureModeGlobal hipStreamCaptureModeGlobal
+#endif  // cudaStreamCaptureModeGlobal
+#ifndef cudaStreamCaptureModeRelaxed
+#define cudaStreamCaptureModeRelaxed hipStreamCaptureModeRelaxed
+#endif  // cudaStreamCaptureModeRelaxed
+#ifndef cudaMemAttachGlobal
+#define cudaMemAttachGlobal hipMemAttachGlobal
+#endif  // cudaMemAttachGlobal
+#ifndef cudaGraphAddEmptyNode
+#define cudaGraphAddEmptyNode hipGraphAddEmptyNode
+#endif  // cudaGraphAddEmptyNode
+
+using CUmemoryPool = hipMemPool_t;

@@ -15,9 +15,6 @@
 
 namespace wp {
 
-constexpr int MESH_BVH_BACKEND_WARP = 0;
-constexpr int MESH_BVH_BACKEND_CUBQL = 1;
-
 struct Mesh {
     array_t<vec3> points;
     array_t<vec3> velocities;
@@ -33,8 +30,6 @@ struct Mesh {
     int num_tris;
 
     BVH bvh;
-    CuBQLBVH cubql_bvh;
-    int bvh_backend;
 
     void* context;
     float average_edge_length;
@@ -50,8 +45,6 @@ struct Mesh {
         solid_angle_props = nullptr;
         average_edge_length = 0.0f;
         bvh = BVH {};
-        cubql_bvh = CuBQLBVH {};
-        bvh_backend = MESH_BVH_BACKEND_WARP;
     }
 
     inline CUDA_CALLABLE Mesh(
@@ -74,23 +67,18 @@ struct Mesh {
         solid_angle_props = nullptr;
         average_edge_length = 0.0f;
         bvh = BVH {};
-        cubql_bvh = CuBQLBVH {};
-        bvh_backend = MESH_BVH_BACKEND_WARP;
     }
 };
 
 CUDA_CALLABLE inline Mesh mesh_get(uint64_t id) { return *(Mesh*)(id); }
-CUDA_CALLABLE inline bool mesh_uses_cubql(const Mesh& mesh) { return mesh.bvh_backend == MESH_BVH_BACKEND_CUBQL; }
+
+// Return the id of the mesh's internal BVH so it can be queried directly with the bvh_query_* builtins.
+// The id is simply the address of the embedded BVH (bvh_get() casts it straight back to a BVH*).
+CUDA_CALLABLE inline uint64_t mesh_get_bvh(uint64_t id) { return (uint64_t)&(((Mesh*)id)->bvh); }
 
 CUDA_CALLABLE inline int mesh_get_group_root(uint64_t id, int group_id)
 {
     Mesh* mesh = (Mesh*)(id);
-    if (mesh_uses_cubql(*mesh)) {
-#if BVH_DEBUG
-        printf("ERROR: mesh_get_group_root not supported for cubql\n");
-#endif
-        return -1;
-    }
     return bvh_get_group_root((uint64_t)&mesh->bvh, group_id);
 }
 
@@ -141,12 +129,6 @@ CUDA_CALLABLE inline bool
 mesh_query_point(uint64_t id, const vec3& point, float max_dist, float& inside, int& face, float& u, float& v)
 {
     Mesh mesh = mesh_get(id);
-    if (mesh_uses_cubql(mesh)) {
-#if BVH_DEBUG
-        printf("ERROR: mesh_query_point not supported for cubql\n");
-#endif
-        return false;
-    }
 
     int stack[BVH_QUERY_STACK_SIZE];
     stack[0] = *mesh.bvh.root;
@@ -338,12 +320,6 @@ CUDA_CALLABLE inline bool mesh_query_point_sign_parity(
 )
 {
     Mesh mesh = mesh_get(id);
-    if (mesh_uses_cubql(mesh)) {
-#if BVH_DEBUG
-        printf("ERROR: mesh_query_point_sign_parity not supported for cubql\n");
-#endif
-        return false;
-    }
 
     int stack[BVH_QUERY_STACK_SIZE];
     stack[0] = *mesh.bvh.root;
@@ -526,12 +502,6 @@ CUDA_CALLABLE inline bool
 mesh_query_point_no_sign(uint64_t id, const vec3& point, float max_dist, int& face, float& u, float& v)
 {
     Mesh mesh = mesh_get(id);
-    if (mesh_uses_cubql(mesh)) {
-#if BVH_DEBUG
-        printf("ERROR: mesh_query_point_no_sign not supported for cubql\n");
-#endif
-        return false;
-    }
 
     int stack[BVH_QUERY_STACK_SIZE];
     stack[0] = *mesh.bvh.root;
@@ -710,12 +680,6 @@ CUDA_CALLABLE inline bool
 mesh_query_furthest_point_no_sign(uint64_t id, const vec3& point, float min_dist, int& face, float& u, float& v)
 {
     Mesh mesh = mesh_get(id);
-    if (mesh_uses_cubql(mesh)) {
-#if BVH_DEBUG
-        printf("ERROR: mesh_query_furthest_point_no_sign not supported for cubql\n");
-#endif
-        return false;
-    }
 
     int stack[BVH_QUERY_STACK_SIZE];
     stack[0] = *mesh.bvh.root;
@@ -905,12 +869,6 @@ CUDA_CALLABLE inline bool mesh_query_point_sign_normal(
 )
 {
     Mesh mesh = mesh_get(id);
-    if (mesh_uses_cubql(mesh)) {
-#if BVH_DEBUG
-        printf("ERROR: mesh_query_point_sign_normal not supported for cubql\n");
-#endif
-        return false;
-    }
 
     int stack[BVH_QUERY_STACK_SIZE];
     stack[0] = *mesh.bvh.root;
@@ -1134,12 +1092,6 @@ CUDA_CALLABLE inline bool mesh_query_point_sign_normal(
 CUDA_CALLABLE inline float solid_angle_iterative(uint64_t id, const vec3& p, const float accuracy_sq)
 {
     Mesh mesh = mesh_get(id);
-    if (mesh_uses_cubql(mesh)) {
-#if BVH_DEBUG
-        printf("ERROR: solid_angle_iterative not supported for cubql\n");
-#endif
-        return 0.0f;
-    }
 
     int stack[BVH_QUERY_STACK_SIZE];
     int at_child[BVH_QUERY_STACK_SIZE];  // 0 for left, 1 for right, 2 for done
@@ -1229,12 +1181,6 @@ CUDA_CALLABLE inline bool mesh_query_point_sign_winding_number(
 )
 {
     Mesh mesh = mesh_get(id);
-    if (mesh_uses_cubql(mesh)) {
-#if BVH_DEBUG
-        printf("ERROR: mesh_query_point_sign_winding_number not supported for cubql\n");
-#endif
-        return false;
-    }
 
     int stack[BVH_QUERY_STACK_SIZE];
     stack[0] = *mesh.bvh.root;
@@ -1786,33 +1732,8 @@ CUDA_CALLABLE inline void adj_mesh_query_point_sign_winding_number(
     );
 }
 
-enum class CuBQLRayMode { ClosestHit, AnyHit, CountAll };
-
-// Unified cuBQL BVH ray traversal. The Mode template parameter controls:
-//   ClosestHit  – prune by shrinking t bound, sort children near-to-far, track closest hit
-//   AnyHit      – prune by max_t, return immediately on first hit
-//   CountAll    – no distance pruning, count every intersection with tri_t >= 0
-template <CuBQLRayMode Mode>
-CUDA_CALLABLE inline int cubql_ray_traversal(
-    const Mesh& mesh,
-    const vec3& start,
-    const vec3& dir,
-    float max_t,
-    float& hit_t,
-    float& hit_u,
-    float& hit_v,
-    float& hit_sign,
-    vec3& hit_normal,
-    int& hit_face
-)
+CUDA_CALLABLE inline vec3 mesh_query_ray_safe_dir(const vec3& dir)
 {
-    if (!mesh.cubql_bvh.nodes || !mesh.cubql_bvh.primitive_indices)
-        return 0;
-
-    const int root_index = mesh.cubql_bvh.root ? *mesh.cubql_bvh.root : -1;
-    if (root_index < 0)
-        return 0;
-
     vec3 ray_dir = dir;
     if (ray_dir[0] == 0.0f)
         ray_dir[0] = 1.0e-20f;
@@ -1820,142 +1741,28 @@ CUDA_CALLABLE inline int cubql_ray_traversal(
         ray_dir[1] = 1.0e-20f;
     if (ray_dir[2] == 0.0f)
         ray_dir[2] = 1.0e-20f;
-    const vec3 rcp_dir = vec3(1.0f / ray_dir[0], 1.0f / ray_dir[1], 1.0f / ray_dir[2]);
-
-    float prune_t = (Mode == CuBQLRayMode::CountAll) ? FLT_MAX : max_t;
-    int result = 0;
-
-    uint64_t stack[CUBQL_BVH_QUERY_STACK_SIZE];
-    int stack_size = 0;
-    uint64_t node_admin = mesh.cubql_bvh.nodes[root_index].admin;
-
-    while (true) {
-        while (true) {
-            const uint16_t node_count = uint16_t(node_admin >> 48);
-            if (node_count != 0)
-                break;
-
-            const uint32_t child_offset = uint32_t(node_admin & 0x0000FFFFFFFFFFFFull);
-            const CuBQLNode& n0 = mesh.cubql_bvh.nodes[child_offset + 0];
-            const CuBQLNode& n1 = mesh.cubql_bvh.nodes[child_offset + 1];
-
-            float t0 = FLT_MAX;
-            float t1 = FLT_MAX;
-            const bool o0 = intersect_ray_aabb(start, rcp_dir, n0.lower, n0.upper, t0)
-                && (Mode == CuBQLRayMode::CountAll || t0 < prune_t);
-            const bool o1 = intersect_ray_aabb(start, rcp_dir, n1.lower, n1.upper, t1)
-                && (Mode == CuBQLRayMode::CountAll || t1 < prune_t);
-
-            if (o0) {
-                if (o1) {
-                    if (Mode == CuBQLRayMode::ClosestHit) {
-                        const bool n0_near = (t0 < t1);
-                        if (stack_size >= CUBQL_BVH_QUERY_STACK_SIZE)
-                            return result;  // stack overflow
-                        stack[stack_size++] = n0_near ? n1.admin : n0.admin;
-                        node_admin = n0_near ? n0.admin : n1.admin;
-                    } else {
-                        if (stack_size >= CUBQL_BVH_QUERY_STACK_SIZE)
-                            return result;  // stack overflow
-                        stack[stack_size++] = n1.admin;
-                        node_admin = n0.admin;
-                    }
-                } else {
-                    node_admin = n0.admin;
-                }
-            } else if (o1) {
-                node_admin = n1.admin;
-            } else {
-                node_admin = 0;
-                break;
-            }
-        }
-
-        const uint16_t node_count = uint16_t(node_admin >> 48);
-        if (node_count != 0) {
-            const uint32_t prim_offset = uint32_t(node_admin & 0x0000FFFFFFFFFFFFull);
-            for (int i = 0; i < int(node_count); ++i) {
-                const int primitive_index = int(mesh.cubql_bvh.primitive_indices[prim_offset + i]);
-                const int i0 = mesh.indices[primitive_index * 3 + 0];
-                const int i1 = mesh.indices[primitive_index * 3 + 1];
-                const int i2 = mesh.indices[primitive_index * 3 + 2];
-
-                const vec3 p = mesh.points[i0];
-                const vec3 q = mesh.points[i1];
-                const vec3 r = mesh.points[i2];
-
-                float tri_t, tri_u, tri_v, tri_sign;
-                vec3 tri_n;
-                if (intersect_ray_tri_woop(start, ray_dir, p, q, r, tri_t, tri_u, tri_v, tri_sign, &tri_n)) {
-                    if (tri_t >= 0.0f && (Mode == CuBQLRayMode::CountAll || tri_t < prune_t)) {
-                        if (Mode == CuBQLRayMode::ClosestHit) {
-                            prune_t = tri_t;
-                            hit_t = tri_t;
-                            hit_face = primitive_index;
-                            hit_u = tri_u;
-                            hit_v = tri_v;
-                            hit_sign = tri_sign;
-                            hit_normal = tri_n;
-                        } else if (Mode == CuBQLRayMode::AnyHit) {
-                            return 1;
-                        }
-                        result++;
-                    }
-                }
-            }
-        }
-
-        if (stack_size == 0)
-            break;
-        node_admin = stack[--stack_size];
-    }
-
-    return result;
+    return ray_dir;
 }
 
-CUDA_CALLABLE inline bool mesh_query_ray_cubql(
-    const Mesh& mesh,
+CUDA_CALLABLE inline bool mesh_query_ray_use_fast_aabb(const vec3& dir)
+{
+    return dir[0] != 0.0f && dir[1] != 0.0f && dir[2] != 0.0f;
+}
+
+CUDA_CALLABLE inline bool mesh_query_ray_intersect_aabb(
     const vec3& start,
     const vec3& dir,
-    float max_t,
-    float& t,
-    float& u,
-    float& v,
-    float& sign,
-    vec3& normal,
-    int& face,
-    int root
+    const vec3& rcp_dir,
+    bool fast_aabb,
+    const vec3& lower,
+    const vec3& upper,
+    float& t
 )
 {
-    if (root != -1)
-        return false;
-    if (cubql_ray_traversal<CuBQLRayMode::ClosestHit>(mesh, start, dir, max_t, t, u, v, sign, normal, face) > 0) {
-        normal = normalize(normal);
-        return true;
-    }
-    return false;
-}
-
-CUDA_CALLABLE inline bool
-mesh_query_ray_anyhit_cubql(const Mesh& mesh, const vec3& start, const vec3& dir, float max_t, int root)
-{
-    if (root != -1)
-        return false;
-    float t, u, v, s;
-    vec3 n;
-    int f;
-    return cubql_ray_traversal<CuBQLRayMode::AnyHit>(mesh, start, dir, max_t, t, u, v, s, n, f) > 0;
-}
-
-CUDA_CALLABLE inline int
-mesh_query_ray_count_intersections_cubql(const Mesh& mesh, const vec3& start, const vec3& dir, int root)
-{
-    if (root != -1)
-        return 0;
-    float t, u, v, s;
-    vec3 n;
-    int f;
-    return cubql_ray_traversal<CuBQLRayMode::CountAll>(mesh, start, dir, FLT_MAX, t, u, v, s, n, f);
+    if (fast_aabb)
+        return intersect_ray_aabb(start, rcp_dir, lower, upper, t);
+    else
+        return intersect_ray_aabb_robust(start, dir, rcp_dir, lower, upper, t);
 }
 
 CUDA_CALLABLE inline bool mesh_query_ray(
@@ -1974,12 +1781,8 @@ CUDA_CALLABLE inline bool mesh_query_ray(
 {
 #if defined(__HIPCC__) && defined(__HIP_PLATFORM_AMD__)
     // Speculative BVH traversal with pre-tested children (HIP-only).
+    // cuBQL-built meshes use Warp's native BVH layout, so they share this path.
     Mesh mesh = mesh_get(id);
-
-    // cuBQL-backed meshes have no Warp mesh.bvh; dispatch to the cuBQL
-    // traversal before touching mesh.bvh (whose root pointer is null here).
-    if (mesh_uses_cubql(mesh))
-        return mesh_query_ray_cubql(mesh, start, dir, max_t, t, u, v, sign, normal, face, root);
 
     // Stack stores node index + entry distance for early termination
     struct StackEntry {
@@ -1989,8 +1792,10 @@ CUDA_CALLABLE inline bool mesh_query_ray(
     StackEntry stack[BVH_QUERY_STACK_SIZE];
     int count = 0;
 
-    const vec3 rcp_dir = vec3(1.0f / dir[0], 1.0f / dir[1], 1.0f / dir[2]);
-    const float eps = 1.e-3f;
+    // Same robust ray/AABB handling as the generic path (axis-aligned and degenerate directions).
+    const vec3 ray_dir = mesh_query_ray_safe_dir(dir);
+    const vec3 rcp_dir(1.0f / ray_dir[0], 1.0f / ray_dir[1], 1.0f / ray_dir[2]);
+    const bool fast_aabb = mesh_query_ray_use_fast_aabb(dir);
 
     float min_t = max_t;
     int min_face = -1;
@@ -2005,10 +1810,9 @@ CUDA_CALLABLE inline bool mesh_query_ray(
     BVHPackedNodeHalf root_upper = bvh_load_node(mesh.bvh.node_uppers, root_idx);
 
     float root_t;
-    bool root_hit = intersect_ray_aabb(
-        start, rcp_dir,
-        vec3(root_lower.x - eps, root_lower.y - eps, root_lower.z - eps),
-        vec3(root_upper.x + eps, root_upper.y + eps, root_upper.z + eps), root_t
+    bool root_hit = mesh_query_ray_intersect_aabb(
+        start, dir, rcp_dir, fast_aabb, vec3(root_lower.x, root_lower.y, root_lower.z),
+        vec3(root_upper.x, root_upper.y, root_upper.z), root_t
     );
 
     if (!root_hit || root_t >= min_t)
@@ -2072,16 +1876,14 @@ CUDA_CALLABLE inline bool mesh_query_ray(
 
             // Test both children
             float left_t, right_t;
-            const bool left_hit = intersect_ray_aabb(
-                start, rcp_dir,
-                vec3(left_lower.x - eps, left_lower.y - eps, left_lower.z - eps),
-                vec3(left_upper.x + eps, left_upper.y + eps, left_upper.z + eps), left_t
+            const bool left_hit = mesh_query_ray_intersect_aabb(
+                start, dir, rcp_dir, fast_aabb, vec3(left_lower.x, left_lower.y, left_lower.z),
+                vec3(left_upper.x, left_upper.y, left_upper.z), left_t
             ) && left_t < min_t;
 
-            const bool right_hit = intersect_ray_aabb(
-                start, rcp_dir,
-                vec3(right_lower.x - eps, right_lower.y - eps, right_lower.z - eps),
-                vec3(right_upper.x + eps, right_upper.y + eps, right_upper.z + eps), right_t
+            const bool right_hit = mesh_query_ray_intersect_aabb(
+                start, dir, rcp_dir, fast_aabb, vec3(right_lower.x, right_lower.y, right_lower.z),
+                vec3(right_upper.x, right_upper.y, right_upper.z), right_t
             ) && right_t < min_t;
 
             // Push valid children in distance-sorted order (farther first, nearer last)
@@ -2129,75 +1931,102 @@ CUDA_CALLABLE inline bool mesh_query_ray(
     return false;
 #else
     Mesh mesh = mesh_get(id);
-    if (mesh_uses_cubql(mesh))
-        return mesh_query_ray_cubql(mesh, start, dir, max_t, t, u, v, sign, normal, face, root);
 
-    int stack[BVH_QUERY_STACK_SIZE];
+    uint64_t stack[BVH_QUERY_STACK_SIZE];
+    int stack_size = 0;
+    uint64_t cur_node = bvh_query_node_load(mesh.bvh, (root == -1) ? *mesh.bvh.root : root);
 
-    stack[0] = root == -1 ? *mesh.bvh.root : root;
-    int count = 1;
-
-    vec3 rcp_dir = vec3(1.0f / dir[0], 1.0f / dir[1], 1.0f / dir[2]);
+    vec3 ray_dir = mesh_query_ray_safe_dir(dir);
+    vec3 rcp_dir(1.0f / ray_dir[0], 1.0f / ray_dir[1], 1.0f / ray_dir[2]);
+    const bool fast_aabb = mesh_query_ray_use_fast_aabb(dir);
 
     float min_t = max_t;
     int min_face;
     float min_u;
     float min_v;
     float min_sign = 1.0f;
-    float temp_t;
     vec3 min_normal;
-    const float eps = 1.e-3f;
     bool hit = false;
 
-    while (count) {
-        const int node_index = stack[--count];
+    while (true) {
+        if (bvh_query_node_is_leaf(cur_node)) {
+            const int primitive_begin = bvh_query_node_lower_payload(cur_node);
+            const int primitive_end = bvh_query_node_upper_payload(cur_node);
+            // Leaf: test all primitives in the leaf.
+            for (int pc = primitive_begin; pc < primitive_end; ++pc) {
+                int primitive_index = mesh.bvh.primitive_indices[pc];
+                int i = mesh.indices[primitive_index * 3 + 0];
+                int j = mesh.indices[primitive_index * 3 + 1];
+                int k = mesh.indices[primitive_index * 3 + 2];
 
-        BVHPackedNodeHalf lower = bvh_load_node(mesh.bvh.node_lowers, node_index);
-        BVHPackedNodeHalf upper = bvh_load_node(mesh.bvh.node_uppers, node_index);
+                vec3 p = mesh.points[i];
+                vec3 q = mesh.points[j];
+                vec3 r = mesh.points[k];
 
-        // todo: switch to robust ray-aabb, or expand bounds in build stage
-        hit = intersect_ray_aabb(
-            start, rcp_dir, vec3(lower.x - eps, lower.y - eps, lower.z - eps),
-            vec3(upper.x + eps, upper.y + eps, upper.z + eps), temp_t
-        );
+                float tri_t, tri_u, tri_v, tri_sign;
+                vec3 n;
 
-        if (hit && temp_t < min_t) {
-            if (lower.b) {
-                const int start_index = lower.i;
-                const int end_index = upper.i;
-                // loops through primitives in the leaf
-                for (int primitive_counter = start_index; primitive_counter < end_index; primitive_counter++) {
-                    int primitive_index = mesh.bvh.primitive_indices[primitive_counter];
-                    int i = mesh.indices[primitive_index * 3 + 0];
-                    int j = mesh.indices[primitive_index * 3 + 1];
-                    int k = mesh.indices[primitive_index * 3 + 2];
-
-                    vec3 p = mesh.points[i];
-                    vec3 q = mesh.points[j];
-                    vec3 r = mesh.points[k];
-
-                    float temp_t, temp_u, temp_v, temp_sign;
-                    vec3 n;
-
-                    if (intersect_ray_tri_woop(start, dir, p, q, r, temp_t, temp_u, temp_v, temp_sign, &n)) {
-                        if (temp_t < min_t && temp_t >= 0.0f) {
-                            min_t = temp_t;
-                            min_face = primitive_index;
-                            min_u = temp_u;
-                            min_v = temp_v;
-                            min_sign = temp_sign;
-                            min_normal = n;
-                        }
+                if (intersect_ray_tri_woop(start, dir, p, q, r, tri_t, tri_u, tri_v, tri_sign, &n)) {
+                    if (tri_t < min_t && tri_t >= 0.0f) {
+                        min_t = tri_t;
+                        min_face = primitive_index;
+                        min_u = tri_u;
+                        min_v = tri_v;
+                        min_sign = tri_sign;
+                        min_normal = n;
+                        hit = true;
                     }
                 }
-            } else {
-                stack[count++] = lower.i;
-                stack[count++] = upper.i;
             }
+            if (stack_size == 0)
+                break;
+            cur_node = stack[--stack_size];
+            continue;
+        }
+
+        // Inner node: load both children so we can sort by entry distance.
+        const int left_index = bvh_query_node_lower_payload(cur_node);
+        const int right_index = bvh_query_node_upper_payload(cur_node);
+
+        BVHPackedNodeHalf left_lower = bvh_load_node(mesh.bvh.node_lowers, left_index);
+        BVHPackedNodeHalf left_upper = bvh_load_node(mesh.bvh.node_uppers, left_index);
+        BVHPackedNodeHalf right_lower = bvh_load_node(mesh.bvh.node_lowers, right_index);
+        BVHPackedNodeHalf right_upper = bvh_load_node(mesh.bvh.node_uppers, right_index);
+
+        float t0 = FLT_MAX;
+        float t1 = FLT_MAX;
+        const bool h0 = mesh_query_ray_intersect_aabb(
+                            start, dir, rcp_dir, fast_aabb, vec3(left_lower.x, left_lower.y, left_lower.z),
+                            vec3(left_upper.x, left_upper.y, left_upper.z), t0
+                        )
+            && t0 < min_t;
+        const bool h1 = mesh_query_ray_intersect_aabb(
+                            start, dir, rcp_dir, fast_aabb, vec3(right_lower.x, right_lower.y, right_lower.z),
+                            vec3(right_upper.x, right_upper.y, right_upper.z), t1
+                        )
+            && t1 < min_t;
+
+        if (h0 && h1) {
+            const bool near_left = (t0 < t1);
+            if (stack_size >= BVH_QUERY_STACK_SIZE)
+                break;
+            const uint64_t left_node = bvh_query_node_pack(left_lower, left_upper);
+            const uint64_t right_node = bvh_query_node_pack(right_lower, right_upper);
+            stack[stack_size++] = near_left ? right_node : left_node;
+            cur_node = near_left ? left_node : right_node;
+        } else if (h0) {
+            cur_node = bvh_query_node_pack(left_lower, left_upper);
+        } else if (h1) {
+            cur_node = bvh_query_node_pack(right_lower, right_upper);
+        } else {
+            // Neither child reachable; pop.
+            if (stack_size == 0)
+                break;
+            cur_node = stack[--stack_size];
         }
     }
 
-    if (min_t < max_t) {
+    if (hit) {
         // write outputs
         u = min_u;
         v = min_v;
@@ -2217,80 +2046,96 @@ CUDA_CALLABLE inline bool
 mesh_query_ray_anyhit(uint64_t id, const vec3& start, const vec3& dir, float max_t, int root = -1)
 {
     Mesh mesh = mesh_get(id);
-    if (mesh_uses_cubql(mesh))
-        return mesh_query_ray_anyhit_cubql(mesh, start, dir, max_t, root);
 
-    int stack[BVH_QUERY_STACK_SIZE];
+    uint64_t stack[BVH_QUERY_STACK_SIZE];
+    int stack_size = 0;
+    uint64_t cur_node = bvh_query_node_load(mesh.bvh, (root == -1) ? *mesh.bvh.root : root);
 
-    stack[0] = root == -1 ? *mesh.bvh.root : root;
-    int count = 1;
+    vec3 ray_dir = mesh_query_ray_safe_dir(dir);
+    vec3 rcp_dir(1.0f / ray_dir[0], 1.0f / ray_dir[1], 1.0f / ray_dir[2]);
+    const bool fast_aabb = mesh_query_ray_use_fast_aabb(dir);
 
-    vec3 rcp_dir = vec3(1.0f / dir[0], 1.0f / dir[1], 1.0f / dir[2]);
+    while (true) {
+        if (bvh_query_node_is_leaf(cur_node)) {
+            const int primitive_begin = bvh_query_node_lower_payload(cur_node);
+            const int primitive_end = bvh_query_node_upper_payload(cur_node);
+            for (int pc = primitive_begin; pc < primitive_end; ++pc) {
+                int primitive_index = mesh.bvh.primitive_indices[pc];
+                int i = mesh.indices[primitive_index * 3 + 0];
+                int j = mesh.indices[primitive_index * 3 + 1];
+                int k = mesh.indices[primitive_index * 3 + 2];
 
-    const float eps = 1.e-3f;
-    float temp_t;
-    bool hit = false;
+                vec3 p = mesh.points[i];
+                vec3 q = mesh.points[j];
+                vec3 r = mesh.points[k];
 
-    while (count) {
-        const int node_index = stack[--count];
+                float tri_t, tri_u, tri_v, tri_sign;
+                vec3 n;
 
-        BVHPackedNodeHalf lower = bvh_load_node(mesh.bvh.node_lowers, node_index);
-        BVHPackedNodeHalf upper = bvh_load_node(mesh.bvh.node_uppers, node_index);
-
-        // todo: switch to robust ray-aabb, or expand bounds in build stage
-        hit = intersect_ray_aabb(
-            start, rcp_dir, vec3(lower.x - eps, lower.y - eps, lower.z - eps),
-            vec3(upper.x + eps, upper.y + eps, upper.z + eps), temp_t
-        );
-
-        if (hit && temp_t < max_t) {
-            if (lower.b) {
-                const int start_index = lower.i;
-                const int end_index = upper.i;
-                // loops through primitives in the leaf
-                for (int primitive_counter = start_index; primitive_counter < end_index; primitive_counter++) {
-                    int primitive_index = mesh.bvh.primitive_indices[primitive_counter];
-                    int i = mesh.indices[primitive_index * 3 + 0];
-                    int j = mesh.indices[primitive_index * 3 + 1];
-                    int k = mesh.indices[primitive_index * 3 + 2];
-
-                    vec3 p = mesh.points[i];
-                    vec3 q = mesh.points[j];
-                    vec3 r = mesh.points[k];
-
-                    float temp_t, temp_u, temp_v, temp_sign;
-                    vec3 n;
-
-                    if (intersect_ray_tri_woop(start, dir, p, q, r, temp_t, temp_u, temp_v, temp_sign, &n)) {
-                        if (temp_t < max_t && temp_t >= 0.0f) {
-                            return true;
-                        }
+                if (intersect_ray_tri_woop(start, dir, p, q, r, tri_t, tri_u, tri_v, tri_sign, &n)) {
+                    if (tri_t < max_t && tri_t >= 0.0f) {
+                        return true;
                     }
                 }
-            } else {
-                stack[count++] = lower.i;
-                stack[count++] = upper.i;
             }
+            if (stack_size == 0)
+                return false;
+            cur_node = stack[--stack_size];
+            continue;
+        }
+
+        const int left_index = bvh_query_node_lower_payload(cur_node);
+        const int right_index = bvh_query_node_upper_payload(cur_node);
+
+        BVHPackedNodeHalf left_lower = bvh_load_node(mesh.bvh.node_lowers, left_index);
+        BVHPackedNodeHalf left_upper = bvh_load_node(mesh.bvh.node_uppers, left_index);
+        BVHPackedNodeHalf right_lower = bvh_load_node(mesh.bvh.node_lowers, right_index);
+        BVHPackedNodeHalf right_upper = bvh_load_node(mesh.bvh.node_uppers, right_index);
+
+        float t0 = FLT_MAX;
+        float t1 = FLT_MAX;
+        const bool h0 = mesh_query_ray_intersect_aabb(
+                            start, dir, rcp_dir, fast_aabb, vec3(left_lower.x, left_lower.y, left_lower.z),
+                            vec3(left_upper.x, left_upper.y, left_upper.z), t0
+                        )
+            && t0 < max_t;
+        const bool h1 = mesh_query_ray_intersect_aabb(
+                            start, dir, rcp_dir, fast_aabb, vec3(right_lower.x, right_lower.y, right_lower.z),
+                            vec3(right_upper.x, right_upper.y, right_upper.z), t1
+                        )
+            && t1 < max_t;
+
+        if (h0 && h1) {
+            const bool near_left = (t0 < t1);
+            if (stack_size >= BVH_QUERY_STACK_SIZE)
+                return false;
+            const uint64_t left_node = bvh_query_node_pack(left_lower, left_upper);
+            const uint64_t right_node = bvh_query_node_pack(right_lower, right_upper);
+            stack[stack_size++] = near_left ? right_node : left_node;
+            cur_node = near_left ? left_node : right_node;
+        } else if (h0) {
+            cur_node = bvh_query_node_pack(left_lower, left_upper);
+        } else if (h1) {
+            cur_node = bvh_query_node_pack(right_lower, right_upper);
+        } else {
+            if (stack_size == 0)
+                return false;
+            cur_node = stack[--stack_size];
         }
     }
-
-    return false;
 }
 
 CUDA_CALLABLE inline int mesh_query_ray_count_intersections(uint64_t id, const vec3& start, const vec3& dir, int root)
 {
     Mesh mesh = mesh_get(id);
-    if (mesh_uses_cubql(mesh))
-        return mesh_query_ray_count_intersections_cubql(mesh, start, dir, root);
 
     int stack[BVH_QUERY_STACK_SIZE];
 
     stack[0] = root == -1 ? *mesh.bvh.root : root;
     int count = 1;
 
-    vec3 rcp_dir = vec3(1.0f / dir[0], 1.0f / dir[1], 1.0f / dir[2]);
+    vec3 rcp_dir(1.0f / dir[0], 1.0f / dir[1], 1.0f / dir[2]);
 
-    const float eps = 1.e-3f;
     int num_hit = 0;
     float temp_t;
 
@@ -2300,10 +2145,8 @@ CUDA_CALLABLE inline int mesh_query_ray_count_intersections(uint64_t id, const v
         BVHPackedNodeHalf lower = bvh_load_node(mesh.bvh.node_lowers, node_index);
         BVHPackedNodeHalf upper = bvh_load_node(mesh.bvh.node_uppers, node_index);
 
-        // todo: switch to robust ray-aabb, or expand bounds in build stage
-        bool hit = intersect_ray_aabb(
-            start, rcp_dir, vec3(lower.x - eps, lower.y - eps, lower.z - eps),
-            vec3(upper.x + eps, upper.y + eps, upper.z + eps), temp_t
+        bool hit = intersect_ray_aabb_robust(
+            start, dir, rcp_dir, vec3(lower.x, lower.y, lower.z), vec3(upper.x, upper.y, upper.z), temp_t
         );
 
         if (hit) {
@@ -2362,8 +2205,6 @@ CUDA_CALLABLE inline bool mesh_query_ray_ordered(
 )
 {
     Mesh mesh = mesh_get(id);
-    if (mesh_uses_cubql(mesh))
-        return mesh_query_ray_cubql(mesh, start, dir, max_t, t, u, v, sign, normal, face, root);
 
     int stack[BVH_QUERY_STACK_SIZE];
     float stack_dist[BVH_QUERY_STACK_SIZE];
@@ -2373,7 +2214,7 @@ CUDA_CALLABLE inline bool mesh_query_ray_ordered(
 
     int count = 1;
 
-    vec3 rcp_dir = vec3(1.0f / dir[0], 1.0f / dir[1], 1.0f / dir[2]);
+    vec3 rcp_dir(1.0f / dir[0], 1.0f / dir[1], 1.0f / dir[2]);
 
     float min_t = max_t;
     int min_face;
@@ -2422,8 +2263,6 @@ CUDA_CALLABLE inline bool mesh_query_ray_ordered(
                     }
                 }
             } else {
-                const float eps = 1.e-3f;
-
                 BVHPackedNodeHalf left_lower = bvh_load_node(mesh.bvh.node_lowers, left_index);
                 BVHPackedNodeHalf left_upper = bvh_load_node(mesh.bvh.node_uppers, left_index);
 
@@ -2431,15 +2270,15 @@ CUDA_CALLABLE inline bool mesh_query_ray_ordered(
                 BVHPackedNodeHalf right_upper = bvh_load_node(mesh.bvh.node_uppers, right_index);
 
                 float left_dist = FLT_MAX;
-                bool left_hit = intersect_ray_aabb(
-                    start, rcp_dir, vec3(left_lower.x - eps, left_lower.y - eps, left_lower.z - eps),
-                    vec3(left_upper.x + eps, left_upper.y + eps, left_upper.z + eps), left_dist
+                bool left_hit = intersect_ray_aabb_robust(
+                    start, dir, rcp_dir, vec3(left_lower.x, left_lower.y, left_lower.z),
+                    vec3(left_upper.x, left_upper.y, left_upper.z), left_dist
                 );
 
                 float right_dist = FLT_MAX;
-                bool right_hit = intersect_ray_aabb(
-                    start, rcp_dir, vec3(right_lower.x - eps, right_lower.y - eps, right_lower.z - eps),
-                    vec3(right_upper.x + eps, right_upper.y + eps, right_upper.z + eps), right_dist
+                bool right_hit = intersect_ray_aabb_robust(
+                    start, dir, rcp_dir, vec3(right_lower.x, right_lower.y, right_lower.z),
+                    vec3(right_upper.x, right_upper.y, right_upper.z), right_dist
                 );
 
 
@@ -2525,40 +2364,6 @@ CUDA_CALLABLE inline void adj_mesh_query_ray(
     );
 }
 
-CUDA_CALLABLE inline void adj_mesh_get_group_root(uint64_t id, int group_id, uint64_t&, int&, int&) { }
-
-CUDA_CALLABLE inline void adj_mesh_query_ray_anyhit(
-    uint64_t id,
-    const vec3& start,
-    const vec3& dir,
-    float max_t,
-    int root,
-    const bool& ret,
-    uint64_t adj_id,
-    vec3& adj_start,
-    vec3& adj_dir,
-    float& adj_max_t,
-    int& adj_root,
-    bool& adj_ret
-)
-{
-}
-
-CUDA_CALLABLE inline void adj_mesh_query_ray_count_intersections(
-    uint64_t id,
-    const vec3& start,
-    const vec3& dir,
-    int root,
-    const int& ret,
-    uint64_t adj_id,
-    vec3& adj_start,
-    vec3& adj_dir,
-    int& adj_root,
-    int& adj_ret
-)
-{
-}
-
 // Stores the result of querying the closest point on a mesh.
 struct mesh_query_ray_t {
     CUDA_CALLABLE mesh_query_ray_t()
@@ -2624,20 +2429,77 @@ CUDA_CALLABLE inline void adj_mesh_query_ray(
     );
 }
 
+// Flat-stack closest-hit traversal that returns only the sign of the closest
+// hit. Used by mesh_query_inside_ray_tracing for the three axis-aligned probe
+// rays: those rays penetrate the whole mesh and rarely allow pruning, so the
+// eager-child-loading overhead of the near-far mesh_query_ray traversal is not
+// worth paying. This function uses the classic push-both-children approach,
+// which has half the BVH node loads per inner step.
+CUDA_CALLABLE inline bool
+mesh_query_ray_closest_sign(const Mesh& mesh, const vec3& start, const vec3& dir, float& out_sign)
+{
+    int stack[BVH_QUERY_STACK_SIZE];
+    int stack_size = 0;
+    int node_index = *mesh.bvh.root;
+
+    vec3 rcp_dir(1.0f / dir[0], 1.0f / dir[1], 1.0f / dir[2]);
+    float min_t = FLT_MAX;
+    float temp_t;
+    bool hit = false;
+
+    while (true) {
+        BVHPackedNodeHalf lower = bvh_load_node(mesh.bvh.node_lowers, node_index);
+        BVHPackedNodeHalf upper = bvh_load_node(mesh.bvh.node_uppers, node_index);
+
+        if (intersect_ray_aabb_robust(
+                start, dir, rcp_dir, vec3(lower.x, lower.y, lower.z), vec3(upper.x, upper.y, upper.z), temp_t
+            )
+            && temp_t < min_t) {
+            if (lower.b) {
+                for (int pc = lower.i; pc < upper.i; ++pc) {
+                    int primitive_index = mesh.bvh.primitive_indices[pc];
+                    int i = mesh.indices[primitive_index * 3 + 0];
+                    int j = mesh.indices[primitive_index * 3 + 1];
+                    int k = mesh.indices[primitive_index * 3 + 2];
+
+                    vec3 p = mesh.points[i];
+                    vec3 q = mesh.points[j];
+                    vec3 r = mesh.points[k];
+
+                    float tri_t, tri_u, tri_v, tri_sign;
+                    vec3 n;
+
+                    if (intersect_ray_tri_woop(start, dir, p, q, r, tri_t, tri_u, tri_v, tri_sign, &n)) {
+                        if (tri_t >= 0.0f && tri_t < min_t) {
+                            min_t = tri_t;
+                            out_sign = tri_sign;
+                            hit = true;
+                        }
+                    }
+                }
+            } else {
+                stack[stack_size++] = lower.i;
+                stack[stack_size++] = upper.i;
+            }
+        }
+
+        if (stack_size == 0)
+            break;
+        node_index = stack[--stack_size];
+    }
+    return hit;
+}
+
 // determine if a point is inside (ret < 0 ) or outside the mesh (ret > 0) using ray tracing
 CUDA_CALLABLE inline float mesh_query_inside_ray_tracing(uint64_t id, const vec3& p)
 {
-    float t, u, v, sign;
-    vec3 n;
-    int face;
+    Mesh mesh = mesh_get(id);
 
     int vote = 0;
+    float sign;
 
     for (int i = 0; i < 3; ++i) {
-        if (mesh_query_ray(
-                id, p, vec3(float(i == 0), float(i == 1), float(i == 2)), FLT_MAX, t, u, v, sign, n, face, -1
-            )
-            && sign < 0) {
+        if (mesh_query_ray_closest_sign(mesh, p, vec3(float(i == 0), float(i == 1), float(i == 2)), sign) && sign < 0) {
             vote++;
         }
     }
@@ -2681,6 +2543,12 @@ mesh_query_inside_parity(uint64_t id, const vec3& p, const vec3 base_dir, int n_
         return 1.0f;
 }
 
+// Mesh query kind, stored in mesh_query_aabb_t::kind for the code paths shared
+// across kinds at runtime (mesh_query_next_dynamic for kind-erased queries, and
+// iter_cmp, the `for face in query:` protocol). The per-kind while-loop iterators
+// are selected at Warp codegen time and never read it.
+enum class MeshQueryKind : uint8_t { AABB = 0, SPHERE = 1 };
+
 // stores state required to traverse the BVH nodes that
 // overlap with a query AABB.
 struct mesh_query_aabb_t {
@@ -2693,6 +2561,8 @@ struct mesh_query_aabb_t {
         , face(0)
         , primitive_counter(-1)
         , last_query_valid(true)
+        , kind(MeshQueryKind::AABB)
+        , radius_sq(0.0f)
     {
     }
 
@@ -2724,49 +2594,47 @@ struct mesh_query_aabb_t {
     // call produced a valid face index. Seeded to true so an initial tile_query_valid()
     // check (before any next() call) reports valid.
     bool last_query_valid;
+    // Read only by the paths shared by all query kinds, which therefore need a runtime
+    // discriminant: mesh_query_next_dynamic (kind-erased queries) and iter_cmp (the
+    // `for face in query:` protocol). The per-kind while-loop iterators are selected at
+    // Warp codegen time from the Python type and never read this.
+    MeshQueryKind kind;
+    // Squared sphere radius for sphere queries (0 for plain AABB queries). Only the square
+    // is stored: every traversal test compares squared distances, and the mesh side has no
+    // capsule mode that would need the linear radius.
+    float radius_sq;
 };
 
 
-CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_aabb(uint64_t id, const vec3& lower, const vec3& upper)
+// Node-overlap test for a mesh query. IsSphere=true uses exact sphere-AABB test;
+// IsSphere=false folds to the original intersect_aabb_aabb test.
+template <bool IsSphere>
+CUDA_CALLABLE inline bool
+mesh_query_node_test(const mesh_query_aabb_t& query, const vec3& node_lower, const vec3& node_upper)
 {
-    // This routine traverses the BVH tree until it finds
-    // the first triangle with an overlapping bvh.
-
-    // initialize empty
-    mesh_query_aabb_t query;
-    query.face = -1;
-
-    Mesh mesh = mesh_get(id);
-    query.mesh = mesh;
-    if (mesh_uses_cubql(mesh)) {
-#if BVH_DEBUG
-        printf("ERROR: mesh_query_aabb not supported for cubql\n");
-#endif
-        return query;
+    if constexpr (IsSphere) {
+        return intersect_sphere_aabb(query.input_lower, query.radius_sq, node_lower, node_upper);
+    } else {
+        return intersect_aabb_aabb(query.input_lower, query.input_upper, node_lower, node_upper);
     }
+}
 
-#if BVH_SHARED_STACK
-    __shared__ int stack[BVH_QUERY_STACK_SIZE * WP_TILE_BLOCK_DIM];
-    query.stack.ptr = &stack[threadIdx.x];
-#endif
+// Init-time descent to the first overlapping leaf node, which is left on the stack for
+// the iterator.
+template <bool IsSphere> CUDA_CALLABLE inline void mesh_query_descend_impl(mesh_query_aabb_t& query)
+{
+    Mesh& mesh = query.mesh;
 
-    query.stack[0] = *mesh.bvh.root;
-    query.count = 1;
-    query.input_lower = lower;
-    query.input_upper = upper;
-
-    // Navigate through the bvh, find the first overlapping leaf node.
     while (query.count) {
         const int nodeIndex = query.stack[--query.count];
         BVHPackedNodeHalf node_lower = bvh_load_node(mesh.bvh.node_lowers, nodeIndex);
         BVHPackedNodeHalf node_upper = bvh_load_node(mesh.bvh.node_uppers, nodeIndex);
 
         if (query.primitive_counter == 0) {
-            if (!intersect_aabb_aabb(
-                    query.input_lower, query.input_upper, reinterpret_cast<vec3&>(node_lower),
-                    reinterpret_cast<vec3&>(node_upper)
+            if (!mesh_query_node_test<IsSphere>(
+                    query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper)
                 )) {
-                // Skip this box, it doesn't overlap with our target box.
+                // Skip this box, it doesn't overlap with our query volume.
                 continue;
             }
         }
@@ -2780,14 +2648,124 @@ CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_aabb(uint64_t id, const vec3& 
             // Back up one level and return
             query.primitive_counter = 0;
             query.stack[query.count++] = nodeIndex;
-            return query;
+            return;
         } else {
             query.stack[query.count++] = left_index;
             query.stack[query.count++] = right_index;
         }
     }
+}
 
+CUDA_CALLABLE inline void mesh_query_descend_sphere(mesh_query_aabb_t& query) { mesh_query_descend_impl<true>(query); }
+
+#if BVH_SHARED_STACK
+// One shared-memory traversal stack per kernel, shared by every mesh query kind.
+// Allocated outside the templated factory: each template instantiation would
+// otherwise declare its own slab, so a kernel constructing both AABB and sphere
+// queries would exceed the shared-memory budget.
+CUDA_CALLABLE inline int* mesh_query_shared_stack()
+{
+    __shared__ int stack[BVH_QUERY_STACK_SIZE * WP_TILE_BLOCK_DIM];
+    return stack;
+}
+#endif
+
+// Shared factory for all mesh query kinds. IsSphere selects the init-time descent
+// strategy and the stored kind (read only on the kind-erased paths; statically-typed
+// iterators are selected at Warp codegen time via the Python return type).
+template <bool IsSphere>
+CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_impl(uint64_t id, const vec3& a, const vec3& b, float radius)
+{
+    mesh_query_aabb_t query;
+    query.face = -1;
+    query.kind = IsSphere ? MeshQueryKind::SPHERE : MeshQueryKind::AABB;
+    const float r = max(radius, 0.0f);
+    query.radius_sq = r * r;
+
+    Mesh mesh = mesh_get(id);
+    query.mesh = mesh;
+
+#if BVH_SHARED_STACK
+    query.stack.ptr = &mesh_query_shared_stack()[threadIdx.x];
+#endif
+
+    query.stack[0] = *mesh.bvh.root;
+    query.count = 1;
+    query.primitive_counter = 0;
+    query.input_lower = a;
+    query.input_upper = b;
+
+    // The AABB descent inlines here (CPU and CUDA); the sphere descent runs
+    // its own specialized loop out of line on CPU.
+    if constexpr (IsSphere) {
+        mesh_query_descend_sphere(query);
+    } else {
+        mesh_query_descend_impl<false>(query);
+    }
     return query;
+}
+
+CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_aabb(uint64_t id, const vec3& lower, const vec3& upper)
+{
+    return mesh_query_impl<false>(id, lower, upper, 0.0f);
+}
+
+// Sphere query: iterate triangles that intersect the sphere. The broad phase keeps triangles whose AABB is
+// within `radius` of `center` (exact sphere-AABB test); the narrow phase keeps only those whose closest
+// point to `center` is within `radius`.
+CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_sphere(uint64_t id, const vec3& center, float radius)
+{
+    return mesh_query_impl<true>(id, center, center, radius);
+}
+
+// Sphere per-primitive test: broad-phase sphere test against the cached triangle AABB,
+// then an exact closest-point narrow phase (with a fallback for degenerate faces).
+CUDA_CALLABLE inline bool mesh_query_prim_test(const mesh_query_aabb_t& query, const Mesh& mesh, int primitive_index)
+{
+    if (!intersect_sphere_aabb(
+            query.input_lower, query.radius_sq, mesh.lowers[primitive_index], mesh.uppers[primitive_index]
+        ))
+        return false;
+
+    int i = mesh.indices[primitive_index * 3 + 0];
+    int j = mesh.indices[primitive_index * 3 + 1];
+    int k = mesh.indices[primitive_index * 3 + 2];
+    vec3 a = mesh.points[i];
+    vec3 b = mesh.points[j];
+    vec3 c = mesh.points[k];
+
+    const vec3& center = query.input_lower;
+    vec3 cp;
+    // Guard against degenerate (zero-area) faces to avoid NaN from closest_point_to_triangle.
+    vec3 ab = b - a, ac = c - a;
+    if (dot(cross(ab, ac), cross(ab, ac)) == 0.0f) {
+        // Degenerate: collapse to segment or point. Find the longest edge.
+        vec3 bc = c - b;
+        float lab2 = dot(ab, ab), lac2 = dot(ac, ac), lbc2 = dot(bc, bc);
+        vec3 p, q;
+        float len2;
+        if (lab2 >= lac2 && lab2 >= lbc2) {
+            p = a;
+            q = b;
+            len2 = lab2;
+        } else if (lac2 >= lbc2) {
+            p = a;
+            q = c;
+            len2 = lac2;
+        } else {
+            p = b;
+            q = c;
+            len2 = lbc2;
+        }
+        vec3 pq = q - p;
+        float t = (len2 > 0.0f) ? clamp(dot(center - p, pq) / len2, 0.0f, 1.0f) : 0.0f;
+        cp = p + t * pq;
+    } else {
+        vec2 uv = closest_point_to_triangle(a, b, c, center);
+        cp = a * uv[0] + b * uv[1] + c * (1.0f - uv[0] - uv[1]);
+    }
+    vec3 d = cp - center;
+    return dot(d, d) <= query.radius_sq;
 }
 
 // Stub
@@ -2796,56 +2774,94 @@ adj_mesh_query_aabb(uint64_t id, const vec3& lower, const vec3& upper, uint64_t,
 {
 }
 
-CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& index)
+
+// ---------------------------------------------------------------------------
+// Mesh query traversal skeleton and per-kind iterators
+//
+// The skeleton is written once as a function template parameterized by a
+// NodeTest and a PrimitiveTest functor.  Each public iterator instantiates
+// it with the matching pair, producing a dispatch-free loop.  Because each
+// public function is called only from the Python type that represents its
+// query kind, NVCC compiles exactly one loop per kernel -- no dead-branch
+// code bloat and no runtime/literal performance difference.
+// ---------------------------------------------------------------------------
+
+struct AabbNodeTest {
+    CUDA_CALLABLE bool operator()(const mesh_query_aabb_t& q, const vec3& lo, const vec3& hi) const
+    {
+        return intersect_aabb_aabb(q.input_lower, q.input_upper, lo, hi);
+    }
+};
+
+struct SphereNodeTest {
+    CUDA_CALLABLE bool operator()(const mesh_query_aabb_t& q, const vec3& lo, const vec3& hi) const
+    {
+        return intersect_sphere_aabb(q.input_lower, q.radius_sq, lo, hi);
+    }
+};
+
+// Broad-phase AABB primitive test: check the triangle's cached AABB only.
+struct AabbPrimitiveTest {
+    CUDA_CALLABLE bool operator()(const mesh_query_aabb_t& q, const Mesh& m, int pi) const
+    {
+        return intersect_aabb_aabb(q.input_lower, q.input_upper, m.lowers[pi], m.uppers[pi]);
+    }
+};
+
+// Sphere primitive test: delegates to mesh_query_prim_test which handles
+// the degenerate-face guard and the closest-point narrow phase.
+struct SpherePrimitiveTest {
+    CUDA_CALLABLE bool operator()(const mesh_query_aabb_t& q, const Mesh& m, int pi) const
+    {
+        return mesh_query_prim_test(q, m, pi);
+    }
+};
+
+// TEST_SINGLETON: whether PrimitiveTest must run on singleton leaves. For the plain
+// (broad-phase) AABB iterator the singleton leaf's bounds equal the cached primitive
+// bounds, so the node test already decided the answer; re-running the primitive test
+// costs two extra dependent global loads per visited singleton leaf (measured +9-21%
+// on singleton-leaf trees, e.g. the cuBQL mesh default). The sphere iterator keeps
+// the test - it is its narrow phase.
+template <typename NodeTest, typename PrimitiveTest, bool TEST_SINGLETON = true>
+CUDA_CALLABLE inline bool mesh_query_next_impl(mesh_query_aabb_t& query, int& index)
 {
     Mesh mesh = query.mesh;
-
-    // Navigate through the bvh, find the first overlapping leaf node.
     while (query.count) {
         const int node_index = query.stack[--query.count];
         BVHPackedNodeHalf node_lower = bvh_load_node(mesh.bvh.node_lowers, node_index);
         BVHPackedNodeHalf node_upper = bvh_load_node(mesh.bvh.node_uppers, node_index);
 
-        if (!intersect_aabb_aabb(
-                query.input_lower, query.input_upper, reinterpret_cast<vec3&>(node_lower),
-                reinterpret_cast<vec3&>(node_upper)
-            )) {
-            // Skip this box, it doesn't overlap with our target box.
+        if (!NodeTest {}(query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper)))
             continue;
-        }
 
         const int left_index = node_lower.i;
         const int right_index = node_upper.i;
 
-        // Make bounds from this AABB
         if (node_lower.b) {
-            // found leaf, loop through its content primitives
             const int start = left_index;
             const int end = right_index;
 
             if (end - start == 1) {
                 int primitive_index = mesh.bvh.primitive_indices[start];
-                index = primitive_index;
-                query.face = primitive_index;
-                return true;
-            } else {
-                int primitive_index = mesh.bvh.primitive_indices[start + (query.primitive_counter++)];
-                // if already visited the last primitive in the leaf node
-                // move to the next node and reset the primitive counter to 0
-                if (start + query.primitive_counter == end) {
-                    query.primitive_counter = 0;
-                }
-                // otherwise we need to keep this leaf node in stack for a future visit
-                else {
-                    query.count++;
-                }
-
-                if (intersect_aabb_aabb(
-                        query.input_lower, query.input_upper, mesh.lowers[primitive_index], mesh.uppers[primitive_index]
-                    )) {
+                bool singleton_hit = true;
+                if constexpr (TEST_SINGLETON)
+                    singleton_hit = PrimitiveTest {}(query, mesh, primitive_index);
+                if (singleton_hit) {
                     index = primitive_index;
                     query.face = primitive_index;
-
+                    return true;
+                }
+            } else {
+                int primitive_index = mesh.bvh.primitive_indices[start + (query.primitive_counter++)];
+                if (start + query.primitive_counter == end) {
+                    query.primitive_counter = 0;
+                } else {
+                    query.count++;
+                }
+                if (PrimitiveTest {}(query, mesh, primitive_index)) {
+                    index = primitive_index;
+                    query.face = primitive_index;
                     return true;
                 }
             }
@@ -2858,13 +2874,40 @@ CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& in
     return false;
 }
 
+// Backward-compatible broad-phase AABB iterator. Called by mesh_query_aabb_next
+// (the alias) and by mesh_query_next when the query object is MeshQueryAABB.
+// AabbPrimitiveTest always passes after AabbNodeTest on singleton leaves
+// (leaf AABB == primitive AABB), so the compiler folds it to a single test.
+CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& index)
+{
+    return mesh_query_next_impl<AabbNodeTest, AabbPrimitiveTest, false>(query, index);
+}
+
+// Sphere iterator -- called from mesh_query_next when the query object is _MeshQuerySphere.
+CUDA_CALLABLE inline bool mesh_query_sphere_next(mesh_query_aabb_t& query, int& index)
+{
+    return mesh_query_next_impl<SphereNodeTest, SpherePrimitiveTest>(query, index);
+}
+
+// Kind-erased iterator (MeshQuery type): used only when the concrete kind is unknown
+// at compile time (a kernel branch merging two kinds, or a function parameter
+// annotated with the parent type), so it dispatches on the kind stored at
+// construction (radius_sq alone cannot distinguish a zero-radius sphere query from
+// an AABB query). The statically-typed iterators above never route through here.
+CUDA_CALLABLE inline bool mesh_query_next_dynamic(mesh_query_aabb_t& query, int& index)
+{
+    if (query.kind == MeshQueryKind::SPHERE)
+        return mesh_query_sphere_next(query, index);
+    return mesh_query_aabb_next(query, index);
+}
 
 CUDA_CALLABLE inline int iter_next(mesh_query_aabb_t& query) { return query.face; }
 
 CUDA_CALLABLE inline bool iter_cmp(mesh_query_aabb_t& query)
 {
-    bool finished = mesh_query_aabb_next(query, query.face);
-    return finished;
+    // The for-loop protocol shares one iter_cmp across all query kinds, so it must
+    // dispatch on the stored kind.
+    return mesh_query_next_dynamic(query, query.face);
 }
 
 CUDA_CALLABLE inline mesh_query_aabb_t iter_reverse(const mesh_query_aabb_t& query)
@@ -2872,19 +2915,6 @@ CUDA_CALLABLE inline mesh_query_aabb_t iter_reverse(const mesh_query_aabb_t& que
     // can't reverse BVH queries, users should not rely on neighbor ordering
     return query;
 }
-
-CUDA_CALLABLE inline void
-adj_iter_reverse(const mesh_query_aabb_t& query, mesh_query_aabb_t& adj_query, mesh_query_aabb_t& adj_ret)
-{
-}
-
-
-// stub
-CUDA_CALLABLE inline void
-adj_mesh_query_aabb_next(mesh_query_aabb_t& query, int& index, mesh_query_aabb_t&, int&, bool&)
-{
-}
-
 
 CUDA_CALLABLE inline vec3 mesh_eval_position(uint64_t id, int tri, float u, float v)
 {
@@ -3012,7 +3042,8 @@ CUDA_CALLABLE inline vec3 mesh_eval_face_normal(uint64_t id, int tri)
 CUDA_CALLABLE inline void
 adj_mesh_eval_face_normal(uint64_t id, int tri, uint64_t& adj_id, int& adj_tri, const vec3& adj_ret)
 {
-    // no-op
+    // MISSINGADJOINT: backprop through normalize(cross(q-p, r-p)) to
+    // mesh.points.grad slots for the three face vertex indices
 }
 
 CUDA_CALLABLE inline vec3 mesh_get_point(uint64_t id, int index)
@@ -3036,7 +3067,8 @@ CUDA_CALLABLE inline vec3 mesh_get_point(uint64_t id, int index)
 CUDA_CALLABLE inline void
 adj_mesh_get_point(uint64_t id, int index, uint64_t& adj_id, int& adj_index, const vec3& adj_ret)
 {
-    // no-op
+    // MISSINGADJOINT: atomic-add adj_ret into mesh.points.grad[index] when the gradient
+    // buffer is allocated
 }
 
 CUDA_CALLABLE inline vec3 mesh_get_velocity(uint64_t id, int index)
@@ -3060,7 +3092,8 @@ CUDA_CALLABLE inline vec3 mesh_get_velocity(uint64_t id, int index)
 CUDA_CALLABLE inline void
 adj_mesh_get_velocity(uint64_t id, int index, uint64_t& adj_id, int& adj_index, const vec3& adj_ret)
 {
-    // no-op
+    // MISSINGADJOINT: atomic-add adj_ret into mesh.velocities.grad[index] when the
+    // gradient buffer is allocated
 }
 
 CUDA_CALLABLE inline int mesh_get_index(uint64_t id, int face_vertex_index)
@@ -3073,12 +3106,6 @@ CUDA_CALLABLE inline int mesh_get_index(uint64_t id, int face_vertex_index)
     assert(face_vertex_index < mesh.num_tris * 3);
 
     return mesh.indices[face_vertex_index];
-}
-
-CUDA_CALLABLE inline void
-adj_mesh_get_index(uint64_t id, int index, uint64_t& adj_id, int& adj_index, const vec3& adj_ret)
-{
-    // no-op
 }
 
 CUDA_CALLABLE bool mesh_get_descriptor(uint64_t id, Mesh& mesh);

@@ -19,28 +19,25 @@ def getkernel(func, suffix=""):
 
 def test_atomic_cas(test, device, dtype, register_kernels=False):
     warp_type = wp.dtype_from_numpy(np.dtype(dtype))
-    n = 100
-    counter = wp.array([0], dtype=warp_type, device=device)
-    lock = wp.array([0], dtype=warp_type, device=device)
 
     @wp.func
-    def spinlock_acquire_1d(lock: wp.array(dtype=warp_type)):
+    def spinlock_acquire_1d(lock: wp.array[warp_type]):
         # Try to acquire the lock by setting it to 1 if it's 0
         while wp.atomic_cas(lock, 0, warp_type(0), warp_type(1)) == 1:
             pass
 
     @wp.func
-    def spinlock_release_1d(lock: wp.array(dtype=warp_type)):
+    def spinlock_release_1d(lock: wp.array[warp_type]):
         # Release the lock by setting it back to 0
         wp.atomic_exch(lock, 0, warp_type(0))
 
     @wp.func
-    def volatile_read_1d(ptr: wp.array(dtype=warp_type), index: int):
+    def volatile_read_1d(ptr: wp.array[warp_type], index: int):
         value = wp.atomic_exch(ptr, index, warp_type(0))
         wp.atomic_exch(ptr, index, value)
         return value
 
-    def test_spinlock_counter_1d(counter: wp.array(dtype=warp_type), lock: wp.array(dtype=warp_type)):
+    def test_spinlock_counter_1d(counter: wp.array[warp_type], lock: wp.array[warp_type]):
         # Try to acquire the lock
         spinlock_acquire_1d(lock)
 
@@ -54,27 +51,15 @@ def test_atomic_cas(test, device, dtype, register_kernels=False):
         # Release the lock
         spinlock_release_1d(lock)
 
-    # Lock-free CAS counter: safe on HIP/AMD where wavefronts execute in
-    # lockstep and spinlocks would deadlock.  Each thread reads the current
-    # value, computes the increment, and attempts a CAS; on failure it retries
-    # with the updated value.  Every iteration makes global progress.
-    def cas_counter_1d(counter: wp.array(dtype=warp_type)):
-        while True:
-            old = wp.atomic_add(counter, 0, warp_type(0))
-            new_val = old + warp_type(1)
-            if wp.atomic_cas(counter, 0, old, new_val) == old:
-                break
-
-    spinlock_kernel = getkernel(test_spinlock_counter_1d, suffix=dtype.__name__)
-    lockfree_kernel = getkernel(cas_counter_1d, suffix=dtype.__name__)
+    kernel = getkernel(test_spinlock_counter_1d, suffix=dtype.__name__)
 
     if register_kernels:
         return
 
-    if wp.get_device(device).is_hip:
-        wp.launch(lockfree_kernel, dim=n, inputs=[counter], device=device)
-    else:
-        wp.launch(spinlock_kernel, dim=n, inputs=[counter, lock], device=device)
+    n = 100
+    counter = wp.array([0], dtype=warp_type, device=device)
+    lock = wp.array([0], dtype=warp_type, device=device)
+    wp.launch(kernel, dim=n, inputs=[counter, lock], device=device)
 
     # Verify counter reached n
     counter_np = counter.numpy()
@@ -88,28 +73,25 @@ def test_atomic_cas(test, device, dtype, register_kernels=False):
 
 def test_atomic_cas_2d(test, device, dtype, register_kernels=False):
     warp_type = wp.dtype_from_numpy(np.dtype(dtype))
-    n = 100
-    counter = wp.array([0], dtype=warp_type, device=device)
-    lock = wp.zeros(shape=(1, 1), dtype=warp_type, device=device)
 
     @wp.func
-    def spinlock_acquire_2d(lock: wp.array2d(dtype=warp_type)):
+    def spinlock_acquire_2d(lock: wp.array2d[warp_type]):
         # Try to acquire the lock by setting it to 1 if it's 0
         while wp.atomic_cas(lock, 0, 0, warp_type(0), warp_type(1)) == 1:
             pass
 
     @wp.func
-    def spinlock_release_2d(lock: wp.array2d(dtype=warp_type)):
+    def spinlock_release_2d(lock: wp.array2d[warp_type]):
         # Release the lock by setting it back to 0
         wp.atomic_exch(lock, 0, 0, warp_type(0))
 
     @wp.func
-    def volatile_read_2d(ptr: wp.array(dtype=warp_type), index: int):
+    def volatile_read_2d(ptr: wp.array[warp_type], index: int):
         value = wp.atomic_exch(ptr, index, warp_type(0))
         wp.atomic_exch(ptr, index, value)
         return value
 
-    def test_spinlock_counter_2d(counter: wp.array(dtype=warp_type), lock: wp.array2d(dtype=warp_type)):
+    def test_spinlock_counter_2d(counter: wp.array[warp_type], lock: wp.array2d[warp_type]):
         # Try to acquire the lock
         spinlock_acquire_2d(lock)
 
@@ -123,29 +105,19 @@ def test_atomic_cas_2d(test, device, dtype, register_kernels=False):
         # Release the lock
         spinlock_release_2d(lock)
 
-    # Lock-free CAS counter for HIP – uses 2D array indexing for atomic_cas
-    def cas_counter_2d(counter: wp.array2d(dtype=warp_type)):
-        while True:
-            old = wp.atomic_add(counter, 0, 0, warp_type(0))
-            new_val = old + warp_type(1)
-            if wp.atomic_cas(counter, 0, 0, old, new_val) == old:
-                break
-
-    spinlock_kernel = getkernel(test_spinlock_counter_2d, suffix=dtype.__name__)
-    lockfree_kernel = getkernel(cas_counter_2d, suffix=dtype.__name__)
+    kernel = getkernel(test_spinlock_counter_2d, suffix=dtype.__name__)
 
     if register_kernels:
         return
 
-    if wp.get_device(device).is_hip:
-        counter_2d = wp.zeros(shape=(1, 1), dtype=warp_type, device=device)
-        wp.launch(lockfree_kernel, dim=n, inputs=[counter_2d], device=device)
-        counter_np = counter_2d.numpy()
-        expected = np.full((1, 1), n, dtype=dtype)
-    else:
-        wp.launch(spinlock_kernel, dim=n, inputs=[counter, lock], device=device)
-        counter_np = counter.numpy()
-        expected = np.array([n], dtype=dtype)
+    n = 100
+    counter = wp.array([0], dtype=warp_type, device=device)
+    lock = wp.zeros(shape=(1, 1), dtype=warp_type, device=device)
+    wp.launch(kernel, dim=n, inputs=[counter, lock], device=device)
+
+    # Verify counter reached n
+    counter_np = counter.numpy()
+    expected = np.array([n], dtype=dtype)
 
     if not np.array_equal(counter_np, expected):
         print(f"Counter mismatch: expected {expected}, got {counter_np}")
@@ -155,28 +127,25 @@ def test_atomic_cas_2d(test, device, dtype, register_kernels=False):
 
 def test_atomic_cas_3d(test, device, dtype, register_kernels=False):
     warp_type = wp.dtype_from_numpy(np.dtype(dtype))
-    n = 100
-    counter = wp.array([0], dtype=warp_type, device=device)
-    lock = wp.zeros(shape=(1, 1, 1), dtype=warp_type, device=device)
 
     @wp.func
-    def spinlock_acquire_3d(lock: wp.array3d(dtype=warp_type)):
+    def spinlock_acquire_3d(lock: wp.array3d[warp_type]):
         # Try to acquire the lock by setting it to 1 if it's 0
         while wp.atomic_cas(lock, 0, 0, 0, warp_type(0), warp_type(1)) == 1:
             pass
 
     @wp.func
-    def spinlock_release_3d(lock: wp.array3d(dtype=warp_type)):
+    def spinlock_release_3d(lock: wp.array3d[warp_type]):
         # Release the lock by setting it back to 0
         wp.atomic_exch(lock, 0, 0, 0, warp_type(0))
 
     @wp.func
-    def volatile_read_3d(ptr: wp.array(dtype=warp_type), index: int):
+    def volatile_read_3d(ptr: wp.array[warp_type], index: int):
         value = wp.atomic_exch(ptr, index, warp_type(0))
         wp.atomic_exch(ptr, index, value)
         return value
 
-    def test_spinlock_counter_3d(counter: wp.array(dtype=warp_type), lock: wp.array3d(dtype=warp_type)):
+    def test_spinlock_counter_3d(counter: wp.array[warp_type], lock: wp.array3d[warp_type]):
         # Try to acquire the lock
         spinlock_acquire_3d(lock)
 
@@ -190,29 +159,19 @@ def test_atomic_cas_3d(test, device, dtype, register_kernels=False):
         # Release the lock
         spinlock_release_3d(lock)
 
-    # Lock-free CAS counter for HIP – uses 3D array indexing for atomic_cas
-    def cas_counter_3d(counter: wp.array3d(dtype=warp_type)):
-        while True:
-            old = wp.atomic_add(counter, 0, 0, 0, warp_type(0))
-            new_val = old + warp_type(1)
-            if wp.atomic_cas(counter, 0, 0, 0, old, new_val) == old:
-                break
-
-    spinlock_kernel = getkernel(test_spinlock_counter_3d, suffix=dtype.__name__)
-    lockfree_kernel = getkernel(cas_counter_3d, suffix=dtype.__name__)
+    kernel = getkernel(test_spinlock_counter_3d, suffix=dtype.__name__)
 
     if register_kernels:
         return
 
-    if wp.get_device(device).is_hip:
-        counter_3d = wp.zeros(shape=(1, 1, 1), dtype=warp_type, device=device)
-        wp.launch(lockfree_kernel, dim=n, inputs=[counter_3d], device=device)
-        counter_np = counter_3d.numpy()
-        expected = np.full((1, 1, 1), n, dtype=dtype)
-    else:
-        wp.launch(spinlock_kernel, dim=n, inputs=[counter, lock], device=device)
-        counter_np = counter.numpy()
-        expected = np.array([n], dtype=dtype)
+    n = 100
+    counter = wp.array([0], dtype=warp_type, device=device)
+    lock = wp.zeros(shape=(1, 1, 1), dtype=warp_type, device=device)
+    wp.launch(kernel, dim=n, inputs=[counter, lock], device=device)
+
+    # Verify counter reached n
+    counter_np = counter.numpy()
+    expected = np.array([n], dtype=dtype)
 
     if not np.array_equal(counter_np, expected):
         print(f"Counter mismatch: expected {expected}, got {counter_np}")
@@ -222,24 +181,24 @@ def test_atomic_cas_3d(test, device, dtype, register_kernels=False):
 
 def create_spinlock_test_4d(dtype):
     @wp.func
-    def spinlock_acquire(lock: wp.array(dtype=dtype, ndim=4)):
+    def spinlock_acquire(lock: wp.array4d[dtype]):
         # Try to acquire the lock by setting it to 1 if it's 0
         while wp.atomic_cas(lock, 0, 0, 0, 0, dtype(0), dtype(1)) == 1:
             pass
 
     @wp.func
-    def spinlock_release(lock: wp.array(dtype=dtype, ndim=4)):
+    def spinlock_release(lock: wp.array4d[dtype]):
         # Release the lock by setting it back to 0
         wp.atomic_exch(lock, 0, 0, 0, 0, dtype(0))
 
     @wp.func
-    def volatile_read(ptr: wp.array(dtype=dtype), index: int):
+    def volatile_read(ptr: wp.array[dtype], index: int):
         value = wp.atomic_exch(ptr, index, dtype(0))
         wp.atomic_exch(ptr, index, value)
         return value
 
     @wp.kernel
-    def test_spinlock_counter(counter: wp.array(dtype=dtype), lock: wp.array(dtype=dtype, ndim=4)):
+    def test_spinlock_counter(counter: wp.array[dtype], lock: wp.array4d[dtype]):
         # Try to acquire the lock
         spinlock_acquire(lock)
 
@@ -258,28 +217,25 @@ def create_spinlock_test_4d(dtype):
 
 def test_atomic_cas_4d(test, device, dtype, register_kernels=False):
     warp_type = wp.dtype_from_numpy(np.dtype(dtype))
-    n = 100
-    counter = wp.array([0], dtype=warp_type, device=device)
-    lock = wp.zeros(shape=(1, 1, 1, 1), dtype=warp_type, device=device)
 
     @wp.func
-    def spinlock_acquire_4d(lock: wp.array4d(dtype=warp_type)):
+    def spinlock_acquire_4d(lock: wp.array4d[warp_type]):
         # Try to acquire the lock by setting it to 1 if it's 0
         while wp.atomic_cas(lock, 0, 0, 0, 0, warp_type(0), warp_type(1)) == 1:
             pass
 
     @wp.func
-    def spinlock_release_4d(lock: wp.array4d(dtype=warp_type)):
+    def spinlock_release_4d(lock: wp.array4d[warp_type]):
         # Release the lock by setting it back to 0
         wp.atomic_exch(lock, 0, 0, 0, 0, warp_type(0))
 
     @wp.func
-    def volatile_read_4d(ptr: wp.array(dtype=warp_type), index: int):
+    def volatile_read_4d(ptr: wp.array[warp_type], index: int):
         value = wp.atomic_exch(ptr, index, warp_type(0))
         wp.atomic_exch(ptr, index, value)
         return value
 
-    def test_spinlock_counter_4d(counter: wp.array(dtype=warp_type), lock: wp.array4d(dtype=warp_type)):
+    def test_spinlock_counter_4d(counter: wp.array[warp_type], lock: wp.array4d[warp_type]):
         # Try to acquire the lock
         spinlock_acquire_4d(lock)
 
@@ -293,29 +249,19 @@ def test_atomic_cas_4d(test, device, dtype, register_kernels=False):
         # Release the lock
         spinlock_release_4d(lock)
 
-    # Lock-free CAS counter for HIP – uses 4D array indexing for atomic_cas
-    def cas_counter_4d(counter: wp.array4d(dtype=warp_type)):
-        while True:
-            old = wp.atomic_add(counter, 0, 0, 0, 0, warp_type(0))
-            new_val = old + warp_type(1)
-            if wp.atomic_cas(counter, 0, 0, 0, 0, old, new_val) == old:
-                break
-
-    spinlock_kernel = getkernel(test_spinlock_counter_4d, suffix=dtype.__name__)
-    lockfree_kernel = getkernel(cas_counter_4d, suffix=dtype.__name__)
+    kernel = getkernel(test_spinlock_counter_4d, suffix=dtype.__name__)
 
     if register_kernels:
         return
 
-    if wp.get_device(device).is_hip:
-        counter_4d = wp.zeros(shape=(1, 1, 1, 1), dtype=warp_type, device=device)
-        wp.launch(lockfree_kernel, dim=n, inputs=[counter_4d], device=device)
-        counter_np = counter_4d.numpy()
-        expected = np.full((1, 1, 1, 1), n, dtype=dtype)
-    else:
-        wp.launch(spinlock_kernel, dim=n, inputs=[counter, lock], device=device)
-        counter_np = counter.numpy()
-        expected = np.array([n], dtype=dtype)
+    n = 100
+    counter = wp.array([0], dtype=warp_type, device=device)
+    lock = wp.zeros(shape=(1, 1, 1, 1), dtype=warp_type, device=device)
+    wp.launch(kernel, dim=n, inputs=[counter, lock], device=device)
+
+    # Verify counter reached n
+    counter_np = counter.numpy()
+    expected = np.array([n], dtype=dtype)
 
     if not np.array_equal(counter_np, expected):
         print(f"Counter mismatch: expected {expected}, got {counter_np}")

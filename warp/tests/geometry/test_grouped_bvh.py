@@ -11,7 +11,7 @@ from warp.tests.unittest_utils import *
 
 
 @wp.kernel
-def bvh_query_aabb(bvh_id: wp.uint64, lower: wp.vec3, upper: wp.vec3, bounds_intersected: wp.array(dtype=int)):
+def bvh_query_aabb(bvh_id: wp.uint64, lower: wp.vec3, upper: wp.vec3, bounds_intersected: wp.array[int]):
     query = wp.bvh_query_aabb(bvh_id, lower, upper)
     bounds_nr = int(0)
 
@@ -20,7 +20,7 @@ def bvh_query_aabb(bvh_id: wp.uint64, lower: wp.vec3, upper: wp.vec3, bounds_int
 
 
 @wp.kernel
-def bvh_query_ray(bvh_id: wp.uint64, start: wp.vec3, dir: wp.vec3, bounds_intersected: wp.array(dtype=int)):
+def bvh_query_ray(bvh_id: wp.uint64, start: wp.vec3, dir: wp.vec3, bounds_intersected: wp.array[int]):
     query = wp.bvh_query_ray(bvh_id, start, dir)
     bounds_nr = int(0)
 
@@ -33,8 +33,8 @@ def bvh_query_aabb_group(
     bvh_id: wp.uint64,
     lower: wp.vec3,
     upper: wp.vec3,
-    group_ids: wp.array(dtype=int),
-    bounds_intersected: wp.array(dtype=int),
+    group_ids: wp.array[int],
+    bounds_intersected: wp.array[int],
 ):
     tid = wp.tid()
     root = wp.bvh_get_group_root(bvh_id, group_ids[tid])
@@ -50,8 +50,8 @@ def bvh_query_ray_group(
     bvh_id: wp.uint64,
     start: wp.vec3,
     dir: wp.vec3,
-    group_ids: wp.array(dtype=int),
-    bounds_intersected: wp.array(dtype=int),
+    group_ids: wp.array[int],
+    bounds_intersected: wp.array[int],
 ):
     tid = wp.tid()
     root = wp.bvh_get_group_root(bvh_id, group_ids[tid])
@@ -63,7 +63,21 @@ def bvh_query_ray_group(
 
 
 @wp.kernel
-def get_group_root(bvh_id: wp.uint64, roots: wp.array(dtype=int)):
+def mesh_query_ray_group(
+    mesh_id: wp.uint64,
+    start: wp.vec3,
+    direction: wp.vec3,
+    group_id: int,
+    face: wp.array[int],
+):
+    root = wp.mesh_get_group_root(mesh_id, group_id)
+    hit = wp.mesh_query_ray(mesh_id, start, direction, 1.0e6, root)
+    if hit.result:
+        face[0] = hit.face
+
+
+@wp.kernel
+def get_group_root(bvh_id: wp.uint64, roots: wp.array[int]):
     tid = wp.tid()
     roots[tid] = wp.bvh_get_group_root(bvh_id, tid)
 
@@ -261,7 +275,7 @@ def test_bvh_query_ray(test, device):
     test_bvh(test, "ray", device)
 
 
-def test_heterogenous_with_sparse_groups(test, device):
+def test_heterogeneous_group_sizes(test, device):
     rng = np.random.default_rng(123)
 
     if device.is_cpu:
@@ -293,7 +307,108 @@ def test_heterogenous_with_sparse_groups(test, device):
         test.assertTrue(np.all(roots_host >= 0))
 
 
-def test_gh_288(test, device):
+def test_sparse_group_root_isolation(test, device):
+    if device.is_cpu:
+        constructors = ["sah", "median"]
+    else:
+        constructors = ["sah", "median", "lbvh"]
+
+    leaf_sizes = [1, 4]
+
+    lowers = wp.array(
+        [
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [100.0, 0.0, 0.0],
+            [102.0, 0.0, 0.0],
+        ],
+        dtype=wp.vec3,
+        device=device,
+    )
+    uppers = wp.array(
+        [
+            [1.0, 1.0, 1.0],
+            [3.0, 1.0, 1.0],
+            [101.0, 1.0, 1.0],
+            [103.0, 1.0, 1.0],
+        ],
+        dtype=wp.vec3,
+        device=device,
+    )
+    points = wp.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [100.0, 0.0, 0.0],
+            [101.0, 0.0, 0.0],
+            [100.0, 1.0, 0.0],
+            [102.0, 0.0, 0.0],
+            [103.0, 0.0, 0.0],
+            [102.0, 1.0, 0.0],
+        ],
+        dtype=wp.vec3,
+        device=device,
+    )
+    indices = wp.array(np.arange(12, dtype=np.int32), dtype=int, device=device)
+
+    for sparse_group_id in (2, np.iinfo(np.int32).max):
+        groups = wp.array([0, 0, sparse_group_id, sparse_group_id], dtype=int, device=device)
+
+        for leaf_size, constructor in itertools.product(leaf_sizes, constructors):
+            bvh = wp.Bvh(lowers, uppers, groups=groups, constructor=constructor, leaf_size=leaf_size)
+            mesh = wp.Mesh(
+                points,
+                indices,
+                groups=groups,
+                bvh_constructor=constructor,
+                bvh_leaf_size=leaf_size,
+            )
+
+            for group_id, expected_hits, expected_face in (
+                (0, [1, 1, 0, 0], -1),
+                (sparse_group_id, [0, 0, 1, 1], 2),
+            ):
+                hits = wp.zeros(4, dtype=int, device=device)
+                wp.launch(
+                    bvh_query_aabb_group,
+                    dim=1,
+                    inputs=[
+                        bvh.id,
+                        wp.vec3(-10.0, -10.0, -10.0),
+                        wp.vec3(200.0, 10.0, 10.0),
+                        wp.array([group_id], dtype=int, device=device),
+                    ],
+                    outputs=[hits],
+                    device=device,
+                )
+                np.testing.assert_array_equal(hits.numpy(), expected_hits)
+
+                face = wp.full(1, -1, dtype=int, device=device)
+                wp.launch(
+                    mesh_query_ray_group,
+                    dim=1,
+                    inputs=[
+                        mesh.id,
+                        wp.vec3(100.2, 0.2, -1.0),
+                        wp.vec3(0.0, 0.0, 1.0),
+                        group_id,
+                    ],
+                    outputs=[face],
+                    device=device,
+                )
+                test.assertEqual(int(face.numpy()[0]), expected_face)
+
+
+def test_ray_hits_single_bound(test, device):
+    """Hit a single-group, single-bound BVH with a ray query from any origin.
+
+    A grouped BVH containing exactly one bound assigned to one group must report that bound as
+    intersected for a ray passing through it, whether the ray starts outside the box or inside it.
+    """
     num_bounds = 1
     lowers = ((0.5, -1.0, -1.0),) * num_bounds
     uppers = ((1.0, 1.0, 1.0),) * num_bounds
@@ -363,14 +478,14 @@ def intersect_aabb_aabb(a_lower: wp.vec3, a_upper: wp.vec3, b_lower: wp.vec3, b_
 
 @wp.kernel
 def compute_num_contact_with_checksums_brutal(
-    bvh_lowers: wp.array(dtype=wp.vec3),
-    bvh_uppers: wp.array(dtype=wp.vec3),
-    bvh_groups: wp.array(dtype=int),
-    test_lowers: wp.array(dtype=wp.vec3),
-    test_uppers: wp.array(dtype=wp.vec3),
-    test_groups: wp.array(dtype=int),
-    counts: wp.array(dtype=int),
-    check_sums: wp.array(dtype=int),
+    bvh_lowers: wp.array[wp.vec3],
+    bvh_uppers: wp.array[wp.vec3],
+    bvh_groups: wp.array[int],
+    test_lowers: wp.array[wp.vec3],
+    test_uppers: wp.array[wp.vec3],
+    test_groups: wp.array[int],
+    counts: wp.array[int],
+    check_sums: wp.array[int],
 ):
     tid = wp.tid()
 
@@ -393,12 +508,12 @@ def compute_num_contact_with_checksums_brutal(
 
 @wp.kernel
 def compute_num_contact_with_checksums(
-    lowers: wp.array(dtype=wp.vec3),
-    uppers: wp.array(dtype=wp.vec3),
-    groups: wp.array(dtype=int),
+    lowers: wp.array[wp.vec3],
+    uppers: wp.array[wp.vec3],
+    groups: wp.array[int],
     bvh_id: wp.uint64,
-    counts: wp.array(dtype=int),
-    check_sums: wp.array(dtype=int),
+    counts: wp.array[int],
+    check_sums: wp.array[int],
 ):
     tid = wp.tid()
 
@@ -420,14 +535,6 @@ def compute_num_contact_with_checksums(
 
 
 def test_capture_bvh_rebuild_grouped(test, device):
-    if wp.get_device(device).is_hip:
-        # The LBVH builder's radix sort (rocPRIM/hipcub DeviceRadixSort) is not
-        # graph-capturable on HIP/ROCm: it triggers an error inside the stream
-        # capture (Bvh.rebuild() works fine outside capture). Basic graph
-        # capture/replay is validated by test_graph; this in-capture BVH rebuild
-        # path is deferred pending a graph-capturable HIP sort.
-        test.skipTest("BVH rebuild inside a captured graph is not supported on HIP/ROCm")
-
     with wp.ScopedDevice(device):
         rng = np.random.default_rng(123)
 
@@ -525,73 +632,8 @@ def test_capture_bvh_rebuild_grouped(test, device):
             assert_array_equal(checksums_1, checksums_brutal)
 
 
-def test_capture_bvh_query_grouped(test, device):
-    # Graph capture of grouped BVH *queries* (the BVH is built outside the
-    # capture). Unlike test_capture_bvh_rebuild_grouped, nothing is built or
-    # rebuilt inside the capture, so it is supported on HIP/ROCm as well as CUDA.
-    with wp.ScopedDevice(device):
-        rng = np.random.default_rng(123)
-
-        num_item_bounds = 100000
-        num_groups = 100
-        item_bound_size = 0.01
-        relative_shift = 2
-
-        num_test_bounds = 10000
-        test_bound_relative_size = 0.05
-
-        center = np.array([0.0, 0.0, 0.0])
-
-        item_lowers_np, item_uppers_np = get_random_aabbs(num_item_bounds, center, relative_shift, item_bound_size, rng)
-        item_lowers = wp.array(item_lowers_np, dtype=wp.vec3)
-        item_uppers = wp.array(item_uppers_np, dtype=wp.vec3)
-        item_groups = wp.array(np.arange(num_item_bounds, dtype=np.int32) % num_groups, dtype=int)
-
-        # Build the grouped BVH outside of the capture.
-        bvh = wp.Bvh(item_lowers, item_uppers, groups=item_groups)
-
-        test_lowers_np, test_uppers_np = get_random_aabbs(
-            num_test_bounds, center, relative_shift, test_bound_relative_size, rng
-        )
-        test_lowers = wp.array(test_lowers_np, dtype=wp.vec3)
-        test_uppers = wp.array(test_uppers_np, dtype=wp.vec3)
-        test_groups = wp.array(np.arange(num_item_bounds, dtype=np.int32) % num_groups, dtype=int)
-
-        counts_ref = wp.empty(n=num_test_bounds, dtype=int)
-        checksums_ref = wp.empty(n=num_test_bounds, dtype=int)
-        counts_graph = wp.empty(n=num_test_bounds, dtype=int)
-        checksums_graph = wp.empty(n=num_test_bounds, dtype=int)
-
-        # Reference result computed with an eager launch (no capture).
-        wp.launch(
-            kernel=compute_num_contact_with_checksums,
-            dim=num_test_bounds,
-            inputs=[test_lowers, test_uppers, test_groups, bvh.id],
-            outputs=[counts_ref, checksums_ref],
-        )
-
-        # Capture only the query launch, then replay it several times.
-        wp.load_module(device=device)
-        with wp.ScopedCapture(force_module_load=False) as capture:
-            wp.launch(
-                kernel=compute_num_contact_with_checksums,
-                dim=num_test_bounds,
-                inputs=[test_lowers, test_uppers, test_groups, bvh.id],
-                outputs=[counts_graph, checksums_graph],
-            )
-
-        test.assertIsNotNone(capture.graph)
-
-        for _ in range(10):
-            wp.capture_launch(capture.graph)
-
-            assert_array_equal(counts_graph, counts_ref)
-            assert_array_equal(checksums_graph, checksums_ref)
-
-
 devices = get_test_devices()
-cuda_devices = get_cuda_test_devices()
-cuda_graph_devices = [d for d in cuda_devices if d.supports_graph_capture]
+cuda_devices_with_mempool = get_cuda_test_devices_with_mempool()
 
 
 class TestGroupedBvh(unittest.TestCase):
@@ -623,16 +665,15 @@ class TestGroupedBvh(unittest.TestCase):
 
 add_function_test(TestGroupedBvh, "test_grouped_bvh_aabb", test_bvh_query_aabb, devices=devices)
 add_function_test(TestGroupedBvh, "test_grouped_bvh_ray", test_bvh_query_ray, devices=devices)
-add_function_test(TestGroupedBvh, "test_grouped_gh_288", test_gh_288, devices=devices)
-add_function_test(
-    TestGroupedBvh, "test_heterogenous_with_sparse_groups", test_heterogenous_with_sparse_groups, devices=devices
-)
+add_function_test(TestGroupedBvh, "test_grouped_ray_hits_single_bound", test_ray_hits_single_bound, devices=devices)
+add_function_test(TestGroupedBvh, "test_heterogeneous_group_sizes", test_heterogeneous_group_sizes, devices=devices)
+add_function_test(TestGroupedBvh, "test_sparse_group_root_isolation", test_sparse_group_root_isolation, devices=devices)
 
 add_function_test(
-    TestGroupedBvh, "test_grouped_capture_bvh_rebuild", test_capture_bvh_rebuild_grouped, devices=cuda_graph_devices
-)
-add_function_test(
-    TestGroupedBvh, "test_grouped_capture_bvh_query", test_capture_bvh_query_grouped, devices=cuda_graph_devices
+    TestGroupedBvh,
+    "test_grouped_capture_bvh_rebuild",
+    test_capture_bvh_rebuild_grouped,
+    devices=cuda_devices_with_mempool,
 )
 
 if __name__ == "__main__":

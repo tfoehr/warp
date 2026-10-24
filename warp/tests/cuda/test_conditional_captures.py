@@ -1125,6 +1125,9 @@ def test_error_alloc_while_subgraph(test, device):
 devices = get_test_devices()
 cuda_devices = get_cuda_test_devices()
 cuda_devices_with_mempool = get_cuda_test_devices_with_mempool()
+# On HIP, conditional bodies are emulated with plain graph segments and allocations made during
+# capture are graph-retained device memory, so allocating in a body is supported there.
+cuda_devices_rejecting_body_allocs = [d for d in cuda_devices_with_mempool if not d.is_hip]
 
 
 class TestConditionalCaptures(unittest.TestCase):
@@ -1192,31 +1195,31 @@ add_function_test(
 )
 
 add_function_test(
-    TestConditionalCaptures, "test_error_alloc_if", test_error_alloc_if, devices=cuda_devices_with_mempool
+    TestConditionalCaptures, "test_error_alloc_if", test_error_alloc_if, devices=cuda_devices_rejecting_body_allocs
 )
 add_function_test(
-    TestConditionalCaptures, "test_error_alloc_else", test_error_alloc_else, devices=cuda_devices_with_mempool
+    TestConditionalCaptures, "test_error_alloc_else", test_error_alloc_else, devices=cuda_devices_rejecting_body_allocs
 )
 add_function_test(
-    TestConditionalCaptures, "test_error_alloc_while", test_error_alloc_while, devices=cuda_devices_with_mempool
+    TestConditionalCaptures, "test_error_alloc_while", test_error_alloc_while, devices=cuda_devices_rejecting_body_allocs
 )
 add_function_test(
     TestConditionalCaptures,
     "test_error_alloc_if_subgraph",
     test_error_alloc_if_subgraph,
-    devices=cuda_devices_with_mempool,
+    devices=cuda_devices_rejecting_body_allocs,
 )
 add_function_test(
     TestConditionalCaptures,
     "test_error_alloc_else_subgraph",
     test_error_alloc_else_subgraph,
-    devices=cuda_devices_with_mempool,
+    devices=cuda_devices_rejecting_body_allocs,
 )
 add_function_test(
     TestConditionalCaptures,
     "test_error_alloc_while_subgraph",
     test_error_alloc_while_subgraph,
-    devices=cuda_devices_with_mempool,
+    devices=cuda_devices_rejecting_body_allocs,
 )
 
 

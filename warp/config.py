@@ -396,8 +396,8 @@ segments are launched as regular graphs and each condition is read back to the h
 branch or loop decision is made. :func:`warp.is_conditional_graph_supported` then returns ``True``
 on HIP.
 
-Replaying such a graph synchronizes the launch stream once per evaluated condition, so the host
-blocks until the work preceding each condition has completed. Graphs without conditionals are
+Replaying such a graph waits on the host once per evaluated condition until the work preceding it
+has completed (see :attr:`hip_conditional_graph_wait`). Graphs without conditionals are
 unaffected and replay as a single native graph launch.
 
 When ``False``, conditional graph capture on HIP raises an error, as with older CUDA toolkits.
@@ -413,13 +413,13 @@ memory that the captured :class:`warp.Graph` keeps alive until both the graph an
 released. Memory freed within the capture is not reused by later allocations in the same capture.
 """
 
-hip_conditional_graph_wait: str = "sync"
+hip_conditional_graph_wait: str = "spin"
 """How the host waits for a condition value while replaying an emulated conditional graph on HIP.
 
-- ``"sync"``: synchronize the launch stream after the condition readback (default).
-- ``"spin"``: poll a pinned host flag written after the condition readback, falling back to a
-  stream synchronization after a short timeout. This can lower the per-condition latency at the
-  cost of a busy CPU core.
+- ``"spin"``: poll the pinned host slot the condition is published to, falling back to a stream
+  synchronization after a short timeout (default). Lowest per-condition latency, at the cost of a
+  busy CPU core while waiting.
+- ``"sync"``: synchronize the launch stream before reading the published condition.
 
 See :attr:`hip_conditional_graph_emulation`.
 """

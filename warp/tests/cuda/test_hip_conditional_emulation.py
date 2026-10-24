@@ -26,6 +26,11 @@ from warp.tests.unittest_utils import *
 
 
 @wp.kernel
+def accumulate_kernel(src: wp.array(dtype=wp.int32), dst: wp.array(dtype=wp.int32)):
+    dst[0] = dst[0] + src[0]
+
+
+@wp.kernel
 def add_kernel(a: wp.array[wp.int32], value: int):
     tid = wp.tid()
     a[tid] = a[tid] + value
@@ -88,14 +93,6 @@ def nested_program_reference(values):
         a = a + 10
         if done:
             return a
-
-
-def has_native_body_check():
-    """Whether this build validates conditional body graphs natively on HIP."""
-    from warp._src.context import runtime  # noqa: PLC0415
-
-    runtime.core.wp_cuda_graph_check_conditional_body(None)
-    return "12.4" not in runtime.get_error_string()
 
 
 class _ConfigOverride:
@@ -372,29 +369,36 @@ def test_body_error_restores_capture(test, device):
         test.assertEqual(a.numpy()[0], 5)
 
 
-def test_alloc_in_body_rejected(test, device):
-    if not has_native_body_check():
-        test.skipTest("Native conditional body validation is not available on this HIP build")
-
+def test_alloc_in_body(test, device):
+    """Allocations in emulated bodies are graph-retained device memory and stay valid across replays."""
     with wp.ScopedDevice(device):
-        cond = wp.ones(1, dtype=wp.int32)
-        with test.assertRaisesRegex(
-            RuntimeError, r"Conditional body graph contains an unsupported operation \(memory allocation\)"
-        ):
-            with wp.ScopedCapture():
-                wp.capture_if(cond, on_true=lambda: wp.zeros(10))
+        total = wp.zeros(1, dtype=wp.int32)
+        count = wp.zeros(1, dtype=wp.int32)
+        wp.load_module(device=device)
 
-        with wp.ScopedCapture() as body_capture:
-            wp.zeros(10)
-        with test.assertRaisesRegex(
-            RuntimeError, r"Child graph contains an unsupported operation \(memory allocation\)"
-        ):
-            with wp.ScopedCapture():
-                wp.capture_while(cond, while_body=body_capture.graph)
+        def body():
+            tmp = wp.full(1, value=2, dtype=wp.int32)  # allocated inside the loop body
+            wp.launch(accumulate_kernel, dim=1, inputs=[tmp, total])
+            wp.launch(decrement_kernel, dim=1, inputs=[count])
+
+        with wp.ScopedCapture(force_module_load=False) as capture:
+            wp.capture_while(count, while_body=body)
+
+        for iterations in (4, 7):
+            total.zero_()
+            count.fill_(iterations)
+            wp.capture_launch(capture.graph)
+            test.assertEqual(total.numpy()[0], 2 * iterations)
 
 
-def test_spin_wait(test, device):
-    with wp.ScopedDevice(device), _ConfigOverride(hip_conditional_graph_wait="spin"):
+def test_wait_modes(test, device):
+    for mode in ("spin", "sync"):
+        with test.subTest(mode=mode):
+            _check_wait_mode(test, device, mode)
+
+
+def _check_wait_mode(test, device, mode):
+    with wp.ScopedDevice(device), _ConfigOverride(hip_conditional_graph_wait=mode):
         a = wp.zeros(1, dtype=wp.int32)
         count = wp.zeros(1, dtype=wp.int32)
         wp.load_module(device=device)
@@ -586,8 +590,8 @@ for _name, _func in (
     ("test_graph_in_graph_splice", test_graph_in_graph_splice),
     ("test_kwargs_forwarded", test_kwargs_forwarded),
     ("test_body_error_restores_capture", test_body_error_restores_capture),
-    ("test_alloc_in_body_rejected", test_alloc_in_body_rejected),
-    ("test_spin_wait", test_spin_wait),
+    ("test_alloc_in_body", test_alloc_in_body),
+    ("test_wait_modes", test_wait_modes),
     ("test_emulation_disabled", test_emulation_disabled),
     ("test_other_stream", test_other_stream),
     ("test_debug_dot_print", test_debug_dot_print),

@@ -5073,6 +5073,10 @@ class CudaMempoolAllocator:
             graph = _hip_retaining_capture(self.device)
             if graph is not None:
                 return _hip_capture_allocate(self.device, graph, size_in_bytes)
+            if self.device.captures and not self.device.stream.is_capturing:
+                # HIP rejects stream-ordered allocations on non-capturing streams while a capture is
+                # active, even in relaxed capture mode (e.g. warp._src.deterministic scratch buffers)
+                return _hip_side_allocate(self.device, size_in_bytes)
         ptr = runtime.core.wp_alloc_device_async(self.device.context, size_in_bytes, WP_CURRENT_STREAM, None)
         if not ptr:
             raise RuntimeError(f"Failed to allocate {size_in_bytes} bytes on device '{self.device}'")
@@ -5082,6 +5086,11 @@ class CudaMempoolAllocator:
     def deallocate(self, ptr, size_in_bytes):
         if _hip_capture_allocs and _hip_capture_deallocate(ptr):
             return
+        if _hip_side_allocs:
+            context = _hip_side_allocs.pop(ptr, None)
+            if context is not None:
+                runtime.core.wp_free_device_default(context, ptr)
+                return
         runtime.core.wp_free_device_async(self.device.context, ptr, None)
 
 
@@ -5120,7 +5129,11 @@ def _hip_retaining_capture(device: Device) -> Graph | None:
     return graph
 
 
-def _hip_capture_allocate(device: Device, graph: Graph, size_in_bytes: int) -> int:
+# pointer -> context, for regular allocations made on non-capturing streams during HIP captures
+_hip_side_allocs: dict[int, ctypes.c_void_p] = {}
+
+
+def _hip_alloc_relaxed(device: Device, size_in_bytes: int) -> int:
     core = runtime.core
     # a non-stream-ordered allocation is a capture-unsafe call, permitted in relaxed mode
     prev_mode = core.wp_cuda_thread_exchange_capture_mode(int(CaptureMode.RELAXED))
@@ -5132,6 +5145,17 @@ def _hip_capture_allocate(device: Device, graph: Graph, size_in_bytes: int) -> i
     if not ptr:
         raise RuntimeError(f"Failed to allocate {size_in_bytes} bytes on device '{device}' during graph capture")
     _set_alloc_tag_if_tracking(ptr)
+    return ptr
+
+
+def _hip_side_allocate(device: Device, size_in_bytes: int) -> int:
+    ptr = _hip_alloc_relaxed(device, size_in_bytes)
+    _hip_side_allocs[ptr] = device.context
+    return ptr
+
+
+def _hip_capture_allocate(device: Device, graph: Graph, size_in_bytes: int) -> int:
+    ptr = _hip_alloc_relaxed(device, size_in_bytes)
     state = _HipCaptureAlloc(device.context)
     _hip_capture_allocs[ptr] = state
     graph._hip_retained_allocs.append((ptr, state))

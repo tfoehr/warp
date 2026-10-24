@@ -23,7 +23,23 @@ import unittest
 import numpy as np
 
 import warp as wp
-from warp.tests.unittest_utils import add_function_test, get_test_devices
+from warp.tests.unittest_utils import add_function_test as _add_function_test
+from warp.tests.unittest_utils import get_test_devices
+
+# APIC .wrp serialization (capture_save) is not supported on HIP devices.
+_HIP_UNSUPPORTED_APIC_TESTS = {
+    "test_capture_with_array_scan_extended_metadata",
+    "test_save_load_array_scan_replay_with_updated_input",
+    "test_save_load_segmented_sort",
+    "test_save_load_segmented_sort_explicit_end",
+}
+
+
+def add_function_test(cls, name, func, devices=None, **kwargs):
+    # Skip tests of APIC features that are not available on HIP devices.
+    if name in _HIP_UNSUPPORTED_APIC_TESTS and devices is not None:
+        devices = [d for d in devices if not d.is_hip]
+    _add_function_test(cls, name, func, devices=devices, **kwargs)
 
 
 @wp.kernel

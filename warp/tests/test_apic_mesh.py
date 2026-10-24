@@ -563,7 +563,8 @@ class TestApicMesh(unittest.TestCase):
     pass
 
 
-devices = get_test_devices_with_cuda_graph_module_load()
+# Every test here round-trips a .wrp file, and capture_save() is not supported on HIP devices.
+devices = [d for d in get_test_devices_with_cuda_graph_module_load() if not d.is_hip]
 
 add_function_test(TestApicMesh, "test_apic_mesh_query_point", test_apic_mesh_query_point, devices=devices)
 add_function_test(TestApicMesh, "test_apic_mesh_query_ray", test_apic_mesh_query_ray, devices=devices)

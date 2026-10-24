@@ -5112,7 +5112,12 @@ def _hip_retaining_capture(device: Device) -> Graph | None:
     """Return the Warp capture on ``device``'s current stream that retains new allocations, if any."""
     if not warp.config.hip_graph_retained_allocations or not device.captures:
         return None
-    return device.captures.get(device.stream)
+    stream = device.stream
+    graph = device.captures.get(stream)
+    if graph is None and stream.is_capturing:
+        # side streams joined to a Warp capture (e.g. ScopedStream with wait) share its capture id
+        graph = runtime.captures.get(runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream))
+    return graph
 
 
 def _hip_capture_allocate(device: Device, graph: Graph, size_in_bytes: int) -> int:

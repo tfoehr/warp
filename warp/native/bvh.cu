@@ -167,21 +167,6 @@ __global__ void bvh_refit_kernel(
 // individual hipMalloc / hipFree calls and the
 // mid-build device synchronisation that was required to free the
 // intermediate block-bounds buffers.
-#if defined(__HIP_PLATFORM_AMD__)
-class LinearBVHBuilderGPU {
-public:
-    // takes a bvh (host ref), and pointers to the GPU lower and upper bounds for each triangle
-    void build(
-        BVH& bvh,
-        const vec3* item_lowers,
-        const vec3* item_uppers,
-        int num_items,
-        bounds3* total_bounds,
-        int* item_groups
-    );
-};
-
-#else
 class LinearBVHBuilderGPU {
 public:
     LinearBVHBuilderGPU();
@@ -196,8 +181,34 @@ public:
         bounds3* total_bounds,
         int* item_groups
     );
-}
+
+private:
+#if defined(__HIP_PLATFORM_AMD__)
+    // The default HIP builder reads the tree depth back to the host and synchronizes, which is
+    // not allowed during graph capture. This is the capture-safe atomics-based builder used then.
+    void build_capturable(
+        BVH& bvh,
+        const vec3* item_lowers,
+        const vec3* item_uppers,
+        int num_items,
+        bounds3* total_bounds,
+        int* item_groups
+    );
 #endif
+
+    // temporary data used during building
+    int* indices;
+    uint64_t* keys;
+    int* deltas;
+    int* range_lefts;
+    int* range_rights;
+    int* num_children;
+
+    // bounds data when total item bounds built on GPU
+    vec3* total_lower;
+    vec3* total_upper;
+    vec3* total_inv_edges;
+};
 
 __global__ void compute_morton_codes(
     const vec3* __restrict__ item_lowers,
@@ -288,6 +299,12 @@ __global__ void build_karras_topology(
 )
 {
     const int i = blockDim.x * blockIdx.x + threadIdx.x;
+    if (n == 1) {
+        // a single item has no internal nodes: the leaf is the root (its parent is already -1)
+        if (i == 0)
+            *root = 0;
+        return;
+    }
     if (i >= n - 1)
         return;  // n-1 internal nodes
 
@@ -760,9 +777,8 @@ __global__ void compute_total_inv_edges(const vec3* total_lower, const vec3* tot
 }
 
 
-// On HIP, constructor / destructor are intentionally empty -- all scratch
-// (including total_lower/upper/inv_edges) is pool-allocated in build().
-#if !defined(__HIP_PLATFORM_AMD__)
+// On HIP, the default build() pool-allocates all of its scratch; the bounds buffers below are
+// only allocated on demand by the capture-safe build_capturable().
 LinearBVHBuilderGPU::LinearBVHBuilderGPU()
     : indices(NULL)
     , keys(NULL)
@@ -774,18 +790,23 @@ LinearBVHBuilderGPU::LinearBVHBuilderGPU()
     , total_upper(NULL)
     , total_inv_edges(NULL)
 {
+#if !defined(__HIP_PLATFORM_AMD__)
     total_lower = (vec3*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(vec3), "(native:bvh)");
     total_upper = (vec3*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(vec3), "(native:bvh)");
     total_inv_edges = (vec3*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(vec3), "(native:bvh)");
+#endif
 }
 
 LinearBVHBuilderGPU::~LinearBVHBuilderGPU()
 {
+#if defined(__HIP_PLATFORM_AMD__)
+    if (!total_lower)
+        return;
+#endif
     wp_free_device(WP_CURRENT_CONTEXT, total_lower);
     wp_free_device(WP_CURRENT_CONTEXT, total_upper);
     wp_free_device(WP_CURRENT_CONTEXT, total_inv_edges);
 }
-#endif  // !__HIP_PLATFORM_AMD__
 
 
 #if defined(__HIP_PLATFORM_AMD__)
@@ -793,6 +814,11 @@ void LinearBVHBuilderGPU::build(
     BVH& bvh, const vec3* item_lowers, const vec3* item_uppers, int num_items, bounds3* total_bounds, int* item_groups
 )
 {
+    if (wp_cuda_stream_is_capturing(wp_cuda_stream_get_current())) {
+        build_capturable(bvh, item_lowers, item_uppers, num_items, total_bounds, item_groups);
+        return;
+    }
+
     constexpr int tree_threads = WP_BVH_BLOCK_DIM;
 
     auto align_up = [](size_t x, size_t a) -> size_t { return (x + a - 1) & ~(a - 1); };
@@ -927,8 +953,13 @@ void LinearBVHBuilderGPU::build(
     (void)cuCtxSynchronize_f();
     wp_free_device(WP_CURRENT_CONTEXT, pool);
 }
+#endif  // __HIP_PLATFORM_AMD__
+
+#if defined(__HIP_PLATFORM_AMD__)
+    void LinearBVHBuilderGPU::build_capturable(
 #else
     void LinearBVHBuilderGPU::build(
+#endif
         BVH& bvh,
         const vec3* item_lowers,
         const vec3* item_uppers,
@@ -937,6 +968,13 @@ void LinearBVHBuilderGPU::build(
         int* item_groups
     )
     {
+#if defined(__HIP_PLATFORM_AMD__)
+        if (!total_lower) {
+            total_lower = (vec3*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(vec3), "(native:bvh)");
+            total_upper = (vec3*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(vec3), "(native:bvh)");
+            total_inv_edges = (vec3*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(vec3), "(native:bvh)");
+        }
+#endif
         // allocate temporary memory used during building
         indices = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * num_items * 2, "(native:bvh)");  // *2 for radix sort
         keys = (uint64_t*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(uint64_t) * num_items * 2, "(native:bvh)");  // *2 for radix sort
@@ -960,6 +998,22 @@ void LinearBVHBuilderGPU::build(
             wp_memcpy_h2d(WP_CURRENT_CONTEXT, total_upper, &total_bounds->upper[0], sizeof(vec3));
             wp_memcpy_h2d(WP_CURRENT_CONTEXT, total_inv_edges, &inv_edges[0], sizeof(vec3));
         } else {
+#if defined(__HIP_PLATFORM_AMD__)
+            // two-pass reduction shared with the default HIP builder (no vec3 atomics)
+            const int nb_bounds = (num_items + WP_BVH_BLOCK_DIM - 1) / WP_BVH_BLOCK_DIM;
+            vec3* block_lowers = (vec3*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(vec3) * nb_bounds, "(native:bvh)");
+            vec3* block_uppers = (vec3*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(vec3) * nb_bounds, "(native:bvh)");
+            wp_launch_device(
+                WP_CURRENT_CONTEXT, compute_block_bounds, num_items,
+                (item_lowers, item_uppers, block_lowers, block_uppers, num_items)
+            );
+            wp_launch_device(
+                WP_CURRENT_CONTEXT, reduce_block_bounds, 1,
+                (block_lowers, block_uppers, nb_bounds, total_lower, total_upper, total_inv_edges)
+            );
+            wp_free_device(WP_CURRENT_CONTEXT, block_lowers);
+            wp_free_device(WP_CURRENT_CONTEXT, block_uppers);
+#else
             // IEEE-754 bit patterns for ± FLT_MAX
             constexpr int FLT_MAX_BITS = 0x7f7fffff;
             constexpr int NEG_FLT_MAX_BITS = 0xff7fffff;
@@ -985,6 +1039,7 @@ void LinearBVHBuilderGPU::build(
             wp_launch_device(
                 WP_CURRENT_CONTEXT, compute_total_inv_edges, 1, (total_lower, total_upper, total_inv_edges)
             );
+#endif
         }
 
         // assign 30-bit Morton code based on the centroid of each triangle and bounds for each leaf
@@ -1034,7 +1089,7 @@ void LinearBVHBuilderGPU::build(
         wp_free_device(WP_CURRENT_CONTEXT, range_rights);
         wp_free_device(WP_CURRENT_CONTEXT, num_children);
     }
-#endif
+
 // buffer_size is the number of T, not the number of bytes
 template <typename T> T* make_device_buffer_of(void* context, T* host_buffer, size_t buffer_size)
 {

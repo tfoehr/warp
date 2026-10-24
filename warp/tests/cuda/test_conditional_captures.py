@@ -1044,8 +1044,16 @@ def body_with_alloc():
     wp.zeros(10)
 
 
+def _skip_if_hip_retained_allocations(test, device):
+    # HIP emulates conditionals with plain graph segments and backs capture-time allocations with
+    # graph-retained memory, so allocations in bodies are valid there.
+    if wp.get_device(device).is_hip and wp.config.hip_graph_retained_allocations:
+        test.skipTest("HIP conditional bodies may allocate (graph-retained allocations)")
+
+
 @unittest.skipUnless(wp.is_conditional_graph_supported(), "Conditional graph nodes not supported")
 def test_error_alloc_if(test, device):
+    _skip_if_hip_retained_allocations(test, device)
     with wp.ScopedDevice(device):
         cond = wp.ones(1, dtype=wp.int32)
         with test.assertRaisesRegex(
@@ -1057,6 +1065,7 @@ def test_error_alloc_if(test, device):
 
 @unittest.skipUnless(wp.is_conditional_graph_supported(), "Conditional graph nodes not supported")
 def test_error_alloc_else(test, device):
+    _skip_if_hip_retained_allocations(test, device)
     with wp.ScopedDevice(device):
         cond = wp.ones(1, dtype=wp.int32)
         with test.assertRaisesRegex(
@@ -1068,6 +1077,7 @@ def test_error_alloc_else(test, device):
 
 @unittest.skipUnless(wp.is_conditional_graph_supported(), "Conditional graph nodes not supported")
 def test_error_alloc_while(test, device):
+    _skip_if_hip_retained_allocations(test, device)
     with wp.ScopedDevice(device):
         cond = wp.ones(1, dtype=wp.int32)
         with test.assertRaisesRegex(
@@ -1079,6 +1089,7 @@ def test_error_alloc_while(test, device):
 
 @unittest.skipUnless(wp.is_conditional_graph_supported(), "Conditional graph nodes not supported")
 def test_error_alloc_if_subgraph(test, device):
+    _skip_if_hip_retained_allocations(test, device)
     with wp.ScopedDevice(device):
         # capture body subgraph
         with wp.ScopedCapture() as body_capture:
@@ -1094,6 +1105,7 @@ def test_error_alloc_if_subgraph(test, device):
 
 @unittest.skipUnless(wp.is_conditional_graph_supported(), "Conditional graph nodes not supported")
 def test_error_alloc_else_subgraph(test, device):
+    _skip_if_hip_retained_allocations(test, device)
     with wp.ScopedDevice(device):
         # capture body subgraph
         with wp.ScopedCapture() as body_capture:
@@ -1109,6 +1121,7 @@ def test_error_alloc_else_subgraph(test, device):
 
 @unittest.skipUnless(wp.is_conditional_graph_supported(), "Conditional graph nodes not supported")
 def test_error_alloc_while_subgraph(test, device):
+    _skip_if_hip_retained_allocations(test, device)
     with wp.ScopedDevice(device):
         # capture body subgraph
         with wp.ScopedCapture() as body_capture:

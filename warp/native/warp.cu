@@ -4850,6 +4850,14 @@ bool wp_cuda_graph_launch(void* graph_exec, void* stream)
     return result;
 }
 
+int64_t wp_cuda_graph_get_node_count(void* graph)
+{
+    size_t num_nodes = 0;
+    if (!graph || !check_cuda(cudaGraphGetNodes((cudaGraph_t)graph, NULL, &num_nodes)))
+        return -1;
+    return int64_t(num_nodes);
+}
+
 bool wp_cuda_graph_destroy(void* context, void* graph)
 {
     // ensure there are no graph captures in progress

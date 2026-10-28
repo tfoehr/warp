@@ -198,6 +198,26 @@ def test_graph_replay_multiple(test, device):
     np.testing.assert_allclose(output_arr.numpy(), np.full(n, 100.0))
 
 
+def test_graph_replay_large_back_to_back(test, device):
+    # Replaying a graph of ~1000 nodes back to back without synchronizing wedged the device
+    # queue on ROCm; see warp.config.hip_graph_max_inflight_nodes.
+    n = 256
+    input_arr = wp.array(np.ones(n, dtype=np.float32), device=device)
+    output_arr = wp.zeros(n, dtype=float, device=device)
+    nodes = 1024
+    replays = 1000
+
+    wp.load_module(device=device)
+    with wp.ScopedCapture(device=device, force_module_load=False) as capture:
+        for _ in range(nodes):
+            wp.launch(add_kernel, dim=n, inputs=[input_arr, output_arr, output_arr], device=device)
+
+    for _i in range(replays):
+        wp.capture_launch(capture.graph)
+
+    np.testing.assert_allclose(output_arr.numpy(), np.full(n, float(nodes * replays)))
+
+
 def test_graph_memcpy(test, device):
     n = 256
     src = wp.array(np.arange(n, dtype=np.float32), device=device)
@@ -1440,6 +1460,12 @@ add_function_test(
     "test_graph_replay_multiple",
     test_graph_replay_multiple,
     devices=devices_with_cuda_graph_module_load,
+)
+add_function_test(
+    TestGraph,
+    "test_graph_replay_large_back_to_back",
+    test_graph_replay_large_back_to_back,
+    devices=cuda_devices_with_cuda_graph_module_load,
 )
 add_function_test(TestGraph, "test_graph_memcpy", test_graph_memcpy, devices=devices)
 add_function_test(TestGraph, "test_graph_memset", test_graph_memset, devices=devices)

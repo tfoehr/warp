@@ -1322,7 +1322,7 @@ static bool hip_is_pageable_host_memory(const void* ptr)
 }
 
 // Returns true if the copy involving host_ptr must be synchronized; drains the stream if so.
-static bool hip_begin_pageable_copy(const void* host_ptr, CUstream stream)
+bool hip_begin_pageable_copy(const void* host_ptr, CUstream stream)
 {
     if (!hip_is_pageable_host_memory(host_ptr) || wp_cuda_stream_is_capturing(stream))
         return false;

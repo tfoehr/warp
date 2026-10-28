@@ -239,6 +239,27 @@ uint64_t wp_texture_get_mip_level_array_device(void* context, uint64_t mipmap_ar
     return reinterpret_cast<uint64_t>(level_array);
 }
 
+// The memory types passed in from Python (warp.MemoryType) use the CUDA driver's CUmemorytype
+// values (HOST=1, DEVICE=2, ARRAY=3). HIP's hipMemoryType shares HOST and DEVICE but uses 3 for
+// managed memory and 10 for arrays, so translate before handing them to the runtime.
+static int texture_memory_type_from_warp(int memory_type)
+{
+#if defined(__HIP_PLATFORM_AMD__)
+    switch (memory_type) {
+    case 1:
+        return CU_MEMORYTYPE_HOST;
+    case 2:
+        return CU_MEMORYTYPE_DEVICE;
+    case 3:
+        return CU_MEMORYTYPE_ARRAY;
+    default:
+        return -1;
+    }
+#else
+    return memory_type;
+#endif
+}
+
 bool wp_texture_copy_device(
     void* context,
     unsigned width_bytes,
@@ -256,6 +277,9 @@ bool wp_texture_copy_device(
 )
 {
     ContextGuard guard(context);
+
+    dst_memory_type = texture_memory_type_from_warp(dst_memory_type);
+    src_memory_type = texture_memory_type_from_warp(src_memory_type);
 
     CUstream cuda_stream = static_cast<CUstream>(stream);
 
@@ -302,7 +326,50 @@ bool wp_texture_copy_device(
     copy_params.srcPitch = src_pitch;
     copy_params.srcHeight = src_height;
 
+#if defined(__HIP_PLATFORM_AMD__)
+    // hipDrvMemcpy3DAsync is not recorded by stream capture: it executes immediately and the
+    // captured graph replays nothing. Add the copy to the capturing graph as a memcpy node instead.
+    CUstreamCaptureStatus capture_status = CU_STREAM_CAPTURE_STATUS_NONE;
+    CUgraph capture_graph = nullptr;
+    const CUgraphNode* capture_deps = nullptr;
+    size_t num_capture_deps = 0;
+    if (!check_cu(cuStreamGetCaptureInfo_f(
+            cuda_stream, &capture_status, nullptr, &capture_graph, &capture_deps, &num_capture_deps
+        )))
+        return false;
+    if (capture_status == CU_STREAM_CAPTURE_STATUS_ACTIVE) {
+        // hipDrvGraphAddMemcpyNode requires the current HIP context (deprecated API, but there is no
+        // replacement for this call).
+        hipCtx_t hip_ctx = nullptr;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+        const hipError_t ctx_result = hipCtxGetCurrent(&hip_ctx);
+#pragma GCC diagnostic pop
+        if (!check_cuda(ctx_result))
+            return false;
+        hipGraphNode_t node = nullptr;
+        if (!check_cuda(hipDrvGraphAddMemcpyNode(
+                &node, capture_graph, capture_deps, num_capture_deps, &copy_params, hip_ctx
+            )))
+            return false;
+        return check_cu(cuStreamUpdateCaptureDependencies_f(cuda_stream, &node, 1, hipStreamSetCaptureDependencies));
+    }
+
+    // Like wp_memcpy_h2d/d2h: hipDrvMemcpy3DAsync may read a pageable source or write a pageable
+    // destination after returning (e.g. after Texture.__init__ has freed its temporary upload
+    // buffer), so complete such copies before returning, as CUDA does.
+    bool pageable = false;
+    if (dst_memory_type == CU_MEMORYTYPE_HOST)
+        pageable = hip_begin_pageable_copy(copy_params.dstHost, cuda_stream);
+    if (src_memory_type == CU_MEMORYTYPE_HOST)
+        pageable = hip_begin_pageable_copy(copy_params.srcHost, cuda_stream) || pageable;
+    bool result = check_cu(cuMemcpy3DAsync_f(&copy_params, cuda_stream));
+    if (result && pageable)
+        result = check_cuda(cudaStreamSynchronize(cuda_stream));
+    return result;
+#else
     return check_cu(cuMemcpy3DAsync_f(&copy_params, cuda_stream));
+#endif
 }
 
 bool wp_texture_descriptor_from_cuda_array(void* context, uint64_t array_handle, wp::cuda_array_desc_t* desc_out)

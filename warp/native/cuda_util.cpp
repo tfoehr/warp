@@ -1310,6 +1310,24 @@ CUresult cuLaunchKernel_f(
 )
 {
 #if defined(__HIP_PLATFORM_AMD__)
+    // CUDA rejects a launch whose dynamic shared memory exceeds what the kernel may use, so the
+    // caller gets an error it can report. hipModuleLaunchKernel() only checks the dynamic size
+    // against the device limit without the kernel's static LDS; an over-budget dispatch then
+    // faults on the device and aborts the process (HSA_STATUS_ERROR_INVALID_ALLOCATION).
+    if (sharedMemBytes > 0) {
+        int device = 0;
+        int max_smem = 0;
+        int static_smem = 0;
+        hipError_t res = hipGetDevice(&device);
+        if (res == hipSuccess)
+            res = hipDeviceGetAttribute(&max_smem, hipDeviceAttributeMaxSharedMemoryPerBlock, device);
+        if (res == hipSuccess)
+            res = hipFuncGetAttribute(&static_smem, HIP_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, f);
+        if (res != hipSuccess)
+            return hip_driver_result(res);
+        if (size_t(sharedMemBytes) + size_t(static_smem) > size_t(max_smem))
+            return hipErrorInvalidValue;
+    }
     return hip_driver_result(hipModuleLaunchKernel(
         f,
         gridDimX,
@@ -1504,7 +1522,7 @@ CUresult cuFuncSetAttribute_f(CUfunction hfunc, CUfunction_attribute attrib, int
         if (res == hipSuccess)
             res = hipFuncGetAttribute(&static_smem, HIP_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, hfunc);
         if (res != hipSuccess)
-            return res;
+            return hip_driver_result(res);
         return (value >= 0 && value + static_smem <= max_smem) ? hipSuccess : hipErrorInvalidValue;
     }
     if (attrib == CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT)

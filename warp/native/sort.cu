@@ -168,7 +168,16 @@ static bool acquire_temp_buffer(size_t size, TempBuffer& temp_ret)
 
         // Use ephemeral graph allocations when the capture is registered
         // and is not a child graph capture (where graph allocations are not allowed).
+#if defined(__HIP_PLATFORM_AMD__)
+        // HIP graph memory nodes can be invalidated when other graphs are captured, and
+        // stream-ordered side allocations made during a capture are not reliable either (see
+        // warp.config.hip_graph_retained_allocations). Use synchronous graph-retained allocations.
+        bool use_graph_allocs = false;
+        bool async_side_alloc = false;
+#else
         bool use_graph_allocs = mempool_supported && capture && capture->id == capture_id;
+        bool async_side_alloc = mempool_supported;
+#endif
 
         if (use_graph_allocs) {
             // Use ephemeral graph allocs, released after use.
@@ -176,7 +185,7 @@ static bool acquire_temp_buffer(size_t size, TempBuffer& temp_ret)
             temp_ret.size = temp_ret.mem ? size : 0;
             temp_ret.is_ephemeral = true;
         } else {
-            cached_side_alloc(size, mempool_supported, stream, capture_id, capture, temp_ret);
+            cached_side_alloc(size, async_side_alloc, stream, capture_id, capture, temp_ret);
         }
     } else {
         // No capture, use global temp cache.

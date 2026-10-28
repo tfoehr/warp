@@ -341,6 +341,8 @@ class TestModuleAOT(unittest.TestCase):
         supported_archs = wp.get_cuda_supported_archs()
         if not supported_archs:
             self.skipTest("NVRTC not available")
+        if any(isinstance(arch, str) for arch in supported_archs):
+            self.skipTest("PTX output is CUDA-only; HIP builds always emit code objects")
 
         arch = supported_archs[0]
 

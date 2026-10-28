@@ -4599,8 +4599,9 @@ class Module:
                         arch_suffix=arch_suffix,
                         pch_dir=runtime.get_nvrtc_pch_dir(),
                         llvm_cuda=options["llvm_cuda"],
-                        # HIPRTC has no precompiled header support
-                        use_precompiled_headers=options["use_precompiled_headers"] and not device.is_hip,
+                        # HIPRTC has no precompiled header support (device is None for deviceless AOT builds)
+                        use_precompiled_headers=options["use_precompiled_headers"]
+                        and not (device.is_hip if device is not None else runtime.is_hip),
                         extra_include_dirs=options["extra_cuda_include_dirs"],
                     )
 
@@ -9277,6 +9278,10 @@ def set_mempool_release_threshold(device: DeviceLike, threshold: int | float) ->
     half of the device's physical memory.  Greater values are interpreted as an absolute number of bytes.
     For example, 1024**3 means one GiB of memory.
 
+    On HIP/ROCm devices, Warp sets the release threshold to the maximum at initialization: releasing
+    pool memory can discard the contents of live allocations that reuse freed blocks. Lowering it
+    re-enables releases and may expose that issue.
+
     Parameters:
         device: The :class:`~warp._src.context.Device` or device identifier
           for which the operation is to be performed.
@@ -13161,6 +13166,12 @@ def capture_end(device: DeviceLike = None, stream: Stream | None = None) -> Grap
     g = ctypes.c_void_p()
     result = runtime.core.wp_cuda_graph_end_capture(device.context, stream.cuda_stream, ctypes.byref(g))
 
+    # release condition slots reserved by capture_begin() if this capture did not use them
+    # (only now: freeing pinned memory while the stream is capturing invalidates the capture)
+    arena = _hip_slot_arenas.get(device.alias) if device.is_hip else None
+    if arena is not None:
+        arena.trim()
+
     # End APIC recording regardless of capture success
     if graph._apic_capture is not None:
         graph._apic_capture.end_recording()
@@ -13394,7 +13405,8 @@ class _HipSlotArena:
 
     Pinned memory cannot be allocated while a stream is capturing, so slots are reserved in
     :func:`capture_begin` and handed out during capture. Slots return to the pool when the
-    graph that owns them is released.
+    graph that owns them is released, and the pinned memory is freed once no graph uses any
+    slot and no capture is in progress on the device.
     """
 
     CHUNK = 1024  # slots per pinned allocation
@@ -13402,8 +13414,16 @@ class _HipSlotArena:
 
     def __init__(self, device: Device):
         self.device = device
-        self.chunks = []  # (host array, device view) pairs, kept alive for the process lifetime
+        self.chunks = []  # (host array, device view) pairs
         self.free = []  # (chunk index, word index)
+        self.in_use = 0
+
+    def trim(self) -> None:
+        """Free the pinned memory if no slot is in use and no graph capture is in progress."""
+        # freeing pinned memory during any capture would invalidate it
+        if self.in_use == 0 and self.chunks and not runtime.captures:
+            self.chunks.clear()
+            self.free.clear()
 
     def reserve(self) -> None:
         if len(self.free) >= self.LOW_WATER:
@@ -13421,10 +13441,13 @@ class _HipSlotArena:
                 f"Too many capture_if()/capture_while() calls in one HIP graph capture "
                 f"(more than {_HipSlotArena.LOW_WATER} new conditionals)"
             )
+        self.in_use += 1
         return self.free.pop()
 
     def release(self, key) -> None:
         self.free.append(key)
+        self.in_use -= 1
+        self.trim()
 
 
 # slot arenas keyed by device alias (Device objects are not hashable)

@@ -234,6 +234,12 @@ class TestModuleParallelLoad(unittest.TestCase):
 
         original_context = context.runtime.core.wp_cuda_context_get_current()
         context.runtime.core.wp_cuda_context_set_current(None)
+        if context.runtime.core.wp_cuda_context_get_current() is not None:
+            # HIP always reports the device's primary context as current
+            context.runtime.core.wp_cuda_context_set_current(original_context)
+            context.user_modules.pop(module_name, None)
+            sys.modules.pop(module_name, None)
+            self.skipTest("The current context cannot be cleared on this platform")
         try:
             with self.assertRaisesRegex(AttributeError, "Could not find function wp.missing_func"):
                 wp.force_load(device=device, modules=[valid_module, failed_module], max_workers=0)

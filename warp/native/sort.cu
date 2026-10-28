@@ -107,6 +107,12 @@ static void cached_side_alloc(
     cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
     void* ptr = NULL;
 
+#if defined(__HIP_PLATFORM_AMD__)
+    // HIP rejects stream-ordered allocations on a non-capturing side stream while a capture is
+    // active (hipErrorStreamCaptureUnsupported), even in relaxed mode; hipMalloc() is permitted.
+    async = false;
+#endif
+
     // Don't free the previous cached buffer here, just allocate a bigger one.
     // All temps must be retained by the graph and freed once the graph is destroyed.
     if (async) {

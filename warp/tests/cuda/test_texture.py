@@ -2883,11 +2883,11 @@ class TestTexture(unittest.TestCase):
     pass
 
 
-# Register tests - skip HIP devices for texture tests
-all_devices = [d for d in get_test_devices() if not d.is_hip]
+# Register tests
+all_devices = get_test_devices()
 cuda_devices = [d for d in all_devices if d.is_cuda]
 
-# Core texture tests - run on all devices (CPU + CUDA); HIP devices are filtered out above
+# Core texture tests - run on all devices (CPU + CUDA)
 add_function_test(TestTexture, "test_texture1d_1channel", test_texture1d_1channel, devices=all_devices)
 add_function_test(TestTexture, "test_texture1d_2channel", test_texture1d_2channel, devices=all_devices)
 add_function_test(TestTexture, "test_texture1d_4channel", test_texture1d_4channel, devices=all_devices)

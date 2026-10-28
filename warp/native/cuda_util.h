@@ -222,6 +222,14 @@ inline bool check_cuda_result(uint64_t code, const char* func, const char* file,
 
 bool check_cu_result(CUresult result, const char* func, const char* file, int line);
 
+#if defined(__HIP_PLATFORM_AMD__)
+// HIP async copies between the device and pageable host memory may still access the host buffer
+// after returning. Returns true if a copy involving host_ptr on this stream must be followed by a
+// stream synchronize to get CUDA's semantics, and drains the stream before the copy if so
+// (see warp.cu).
+bool hip_begin_pageable_copy(const void* host_ptr, CUstream stream);
+#endif
+
 inline uint64_t get_capture_id(CUstream stream)
 {
     CUstreamCaptureStatus status;

@@ -25,13 +25,59 @@ from warp.sparse import (
     bsr_zeros,
 )
 from warp.tests.unittest_utils import (
-    add_function_test,
+    add_function_test as _add_function_test,
+)
+from warp.tests.unittest_utils import (
     get_cuda_test_devices,
     get_test_devices,
     get_test_devices_with_cuda_graph_module_load,
     get_test_devices_with_graph_capture_allocation,
     get_test_devices_with_graph_capture_allocation_and_cuda_graph_module_load,
 )
+
+# APIC .wrp serialization (capture_save) and APIC recording of capture_if()/capture_while()
+# are not supported on HIP devices.
+_HIP_UNSUPPORTED_APIC_TESTS = {
+    "test_apic_capture_if_body_raises_cleanup",
+    "test_apic_capture_while_body_raises_cleanup",
+    "test_bindings_param_update",
+    "test_capture_if_cpu",
+    "test_capture_indexedarray",
+    "test_capture_pause_resume_suspends_apic_recording",
+    "test_capture_save_aborts_on_mesh_registration_failure",
+    "test_capture_save_aborts_on_region_snapshot_failure",
+    "test_capture_struct_with_array",
+    "test_capture_while_cpu",
+    "test_capture_with_large_scalar_param",
+    "test_complex_pipeline",
+    "test_get_param_ptr",
+    "test_internal_allocation",
+    "test_multiple_internal_allocations",
+    "test_save_load_alloc_only",
+    "test_save_load_array_reduction_metadata",
+    "test_save_load_array_reductions",
+    "test_save_load_capture_if_cuda",
+    "test_save_load_capture_time_scratch_cuda",
+    "test_save_load_distinct_modules_same_key",
+    "test_save_load_fill",
+    "test_save_load_memcpy",
+    "test_save_load_memcpy_and_kernel",
+    "test_save_load_memset",
+    "test_save_load_multiple_kernels",
+    "test_save_load_padded_bsr_transpose_cuda_rebuild",
+    "test_save_load_padded_bsr_transpose_too_small",
+    "test_save_load_round_trip",
+    "test_save_load_tiled_nondefault_block_dim",
+    "test_save_load_with_param_update",
+    "test_save_single_kernel",
+}
+
+
+def add_function_test(cls, name, func, devices=None, **kwargs):
+    # Skip tests of APIC features that are not available on HIP devices.
+    if name in _HIP_UNSUPPORTED_APIC_TESTS and devices is not None:
+        devices = [d for d in devices if not d.is_hip]
+    _add_function_test(cls, name, func, devices=devices, **kwargs)
 
 
 @wp.kernel

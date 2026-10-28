@@ -391,6 +391,34 @@ def test_alloc_in_body(test, device):
             test.assertEqual(total.numpy()[0], 2 * iterations)
 
 
+def test_alloc_in_body_across_captures(test, device):
+    """Bodies may allocate, and conditions may be allocated during capture.
+
+    Capture allocations on HIP are graph-retained device memory, so arrays allocated in one
+    segment stay valid in later segments and across replays, also after other graphs are captured.
+    """
+    with wp.ScopedDevice(device):
+        wp.load_module(device=device)
+        total = wp.zeros(1, dtype=wp.int32)
+
+        def body(cond):
+            tmp = wp.zeros(1, dtype=wp.int32)
+            wp.launch(add_kernel, dim=1, inputs=[tmp, 2])
+            wp.launch(accumulate_kernel, dim=1, inputs=[tmp, total])
+            wp.launch(decrement_kernel, dim=1, inputs=[cond])
+
+        with wp.ScopedCapture(force_module_load=False) as capture:
+            cond = wp.full(1, value=3, dtype=wp.int32)
+            wp.capture_while(cond, while_body=body, cond=cond)
+
+        for replay in range(3):
+            # capturing other graphs must not invalidate the allocations of this one
+            with wp.ScopedCapture(force_module_load=False):
+                wp.zeros(4, dtype=wp.int32)
+            wp.capture_launch(capture.graph)
+            test.assertEqual(total.numpy()[0], 6 * (replay + 1))
+
+
 def test_wait_modes(test, device):
     for mode in ("spin", "sync"):
         with test.subTest(mode=mode):
@@ -591,6 +619,7 @@ for _name, _func in (
     ("test_kwargs_forwarded", test_kwargs_forwarded),
     ("test_body_error_restores_capture", test_body_error_restores_capture),
     ("test_alloc_in_body", test_alloc_in_body),
+    ("test_alloc_in_body_across_captures", test_alloc_in_body_across_captures),
     ("test_wait_modes", test_wait_modes),
     ("test_emulation_disabled", test_emulation_disabled),
     ("test_other_stream", test_other_stream),

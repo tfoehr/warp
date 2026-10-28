@@ -65,6 +65,11 @@ def test_tile_shared_mem_large(test, device):
 
     BLOCK_DIM = 256
 
+    # 64 KiB of dynamic shared memory plus the kernel's static reservation must fit
+    # (devices with a 64 KiB limit, e.g. RDNA GPUs, cannot run this kernel)
+    if device.max_shared_memory_per_block <= DIM_M * DIM_N * 4 * 2:
+        test.skipTest(f"Requires more than 64 KiB of shared memory per block on {device}")
+
     # we disable backward kernel gen since 128k is not supported on most architectures
     @wp.kernel(enable_backward=False, module="unique")
     def compute(out: wp.array2d[float]):

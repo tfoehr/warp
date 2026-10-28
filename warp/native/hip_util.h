@@ -378,10 +378,10 @@ static inline hiprtcResult nvrtcGetSupportedArchs(int* archs)
 #define CU_EVENT_WAIT_DEFAULT 0
 #endif  // CU_EVENT_WAIT_DEFAULT
 #ifndef CU_EVENT_RECORD_EXTERNAL
-#define CU_EVENT_RECORD_EXTERNAL 0
+#define CU_EVENT_RECORD_EXTERNAL hipEventRecordExternal
 #endif  // CU_EVENT_RECORD_EXTERNAL
 #ifndef CU_EVENT_WAIT_EXTERNAL
-#define CU_EVENT_WAIT_EXTERNAL 0
+#define CU_EVENT_WAIT_EXTERNAL hipEventWaitExternal
 #endif  // CU_EVENT_WAIT_EXTERNAL
 #ifndef CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS
 #define CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS 0

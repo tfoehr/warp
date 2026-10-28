@@ -7940,6 +7940,8 @@ class Runtime:
 
             self.core.wp_cuda_graph_launch.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
             self.core.wp_cuda_graph_launch.restype = ctypes.c_bool
+            self.core.wp_cuda_graph_get_node_count.argtypes = [ctypes.c_void_p]
+            self.core.wp_cuda_graph_get_node_count.restype = ctypes.c_int64
             self.core.wp_cuda_graph_exec_destroy.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
             self.core.wp_cuda_graph_exec_destroy.restype = ctypes.c_bool
 
@@ -13778,6 +13780,44 @@ def _hip_splice_launch(device: Device, stream: Stream, outer: Graph, graph: Grap
         _hip_begin_segment(device, stream, outer)
 
 
+# per HIP stream: [deque of (completion event, node count), total node count]
+_hip_graph_launches_in_flight: dict[int, list] = {}
+
+
+def _hip_graph_node_count(graph: Graph) -> int:
+    count = getattr(graph, "_hip_node_count", None)
+    if count is None:
+        count = int(runtime.core.wp_cuda_graph_get_node_count(graph.graph))
+        if count < 0:
+            # unknown size: let it wait for all earlier launches
+            count = warp.config.hip_graph_max_inflight_nodes
+        graph._hip_node_count = count
+    return count
+
+
+def _hip_graph_launch(graph: Graph, stream: Stream) -> None:
+    """Launch ``graph.graph_exec`` on a HIP stream within the in-flight node budget.
+
+    See :attr:`warp.config.hip_graph_max_inflight_nodes`.
+    """
+    limit = warp.config.hip_graph_max_inflight_nodes
+    if limit > 0:
+        nodes = _hip_graph_node_count(graph)
+        state = _hip_graph_launches_in_flight.setdefault(stream.cuda_stream, [collections.deque(), 0])
+        in_flight = state[0]
+        while in_flight and state[1] + nodes > limit:
+            event, n = in_flight.popleft()
+            synchronize_event(event)
+            state[1] -= n
+
+    if not runtime.core.wp_cuda_graph_launch(graph.graph_exec, stream.cuda_stream):
+        raise RuntimeError(f"Graph launch error: {runtime.get_error_string()}")
+
+    if limit > 0:
+        in_flight.append((stream.record_event(), nodes))
+        state[1] += nodes
+
+
 def _hip_launch_segment(segment: Graph, stream: Stream) -> None:
     if segment.graph_exec is None:
         g = ctypes.c_void_p()
@@ -13786,8 +13826,7 @@ def _hip_launch_segment(segment: Graph, stream: Stream) -> None:
         ):
             raise RuntimeError(f"Graph creation error: {runtime.get_error_string()}")
         segment.graph_exec = g
-    if not runtime.core.wp_cuda_graph_launch(segment.graph_exec, stream.cuda_stream):
-        raise RuntimeError(f"Graph launch error: {runtime.get_error_string()}")
+    _hip_graph_launch(segment, stream)
 
 
 def _hip_launch_program(nodes: list, stream: Stream, reader: _HipConditionReader) -> None:
@@ -14418,6 +14457,10 @@ def capture_launch(graph: Graph, stream: Stream | None = None):
         if not result:
             raise RuntimeError(f"Graph creation error: {runtime.get_error_string()}")
         graph.graph_exec = g
+
+    if device.is_hip:
+        _hip_graph_launch(graph, stream)
+        return
 
     if not runtime.core.wp_cuda_graph_launch(graph.graph_exec, stream.cuda_stream):
         raise RuntimeError(f"Graph launch error: {runtime.get_error_string()}")

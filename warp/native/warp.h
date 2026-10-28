@@ -767,6 +767,7 @@ WP_API bool wp_cuda_graph_begin_capture(void* context, void* stream, int externa
 WP_API bool wp_cuda_graph_end_capture(void* context, void* stream, void** graph_ret);
 WP_API bool wp_cuda_graph_create_exec(void* context, void* stream, void* graph, void** graph_exec_ret);
 WP_API bool wp_cuda_graph_launch(void* graph, void* stream);
+WP_API int64_t wp_cuda_graph_get_node_count(void* graph);
 WP_API bool wp_cuda_graph_destroy(void* context, void* graph);
 WP_API bool wp_cuda_graph_exec_destroy(void* context, void* graph_exec);
 WP_API bool wp_capture_debug_dot_print(void* graph, const char* path, uint32_t flags);

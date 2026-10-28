@@ -413,6 +413,16 @@ memory that the captured :class:`warp.Graph` keeps alive until both the graph an
 released. Memory freed within the capture is not reused by later allocations in the same capture.
 """
 
+hip_graph_max_inflight_nodes: int = 8192
+"""Maximum number of graph nodes queued but not yet completed per stream on HIP/ROCm devices.
+
+Launching large graphs back to back without waiting can wedge the device queue on ROCm: the
+command processor stops reading it and the host blocks in the next launch, with no kernel running.
+Before a graph launch on a HIP device, the host waits for earlier graph launches on the same
+stream to complete until the nodes in flight, including the new launch, fit this budget. A graph
+larger than the budget waits for all earlier launches. ``0`` disables the limit.
+"""
+
 hip_conditional_graph_wait: str = "spin"
 """How the host waits for a condition value while replaying an emulated conditional graph on HIP.
 

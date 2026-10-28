@@ -5062,7 +5062,14 @@ size_t wp_cuda_compile_program(
     opts.push_back(stored_options.back().c_str());
 
     if (fuse_fp) {
-        stored_options.push_back("-ffp-contract=fast");
+        // Contract a*b+c into FMA only within a single source expression (C/C++ FP_CONTRACT
+        // semantics, the same as Warp's CPU backend), not across statements. Warp emits each
+        // operation of a kernel as a separate statement, so "fast" let the backend fuse
+        // arbitrary products and sums of user code, which changes the rounding of
+        // cancellation-sensitive algorithms (e.g. GJK/EPA support-point differences) enough
+        // to flip contact signs. Expressions inside Warp's builtins (dot, cross, ...) are
+        // still fused.
+        stored_options.push_back("-ffp-contract=on");
         opts.push_back(stored_options.back().c_str());
     } else {
         // Match NVRTC --fmad=false: disable FMA fusion entirely

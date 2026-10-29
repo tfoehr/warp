@@ -630,6 +630,52 @@ def test_segmented_sort_pairs_graph_capture(test, device):
         assert_sort_results(*large[:4], large[4], large[5])
 
 
+def test_segmented_sort_pairs_graph_capture_many_segments(test, device):
+    """Verify segmented sorts with many segments can be captured.
+
+    rocPRIM partitions many segments by size and reads the counts back to the host, which is not
+    allowed during a capture, so Warp sorts without partitioning while capturing on HIP.
+    """
+    rng = np.random.default_rng(7)
+    num_segments = 5000
+    lengths = rng.integers(0, 40, num_segments)
+    lengths[::500] = 3000  # a few large segments next to many small ones
+    starts_np = np.concatenate([[0], np.cumsum(lengths)[:-1]]).astype(np.int32)
+    ends_np = (starts_np + lengths).astype(np.int32)
+    count = int(ends_np[-1])
+
+    for dtype, np_dtype in ((wp.float32, np.float32), (wp.int32, np.int32)):
+        if np_dtype == np.float32:
+            keys_np = rng.random(count, dtype=np.float32)
+        else:
+            keys_np = rng.integers(-1000, 1000, count, dtype=np.int32)
+        values_np = np.arange(count, dtype=np.int32)
+
+        keys = wp.zeros(2 * count, dtype=dtype, device=device)
+        values = wp.zeros(2 * count, dtype=wp.int32, device=device)
+        starts = wp.array(starts_np, dtype=wp.int32, device=device)
+        ends = wp.array(ends_np, dtype=wp.int32, device=device)
+
+        def reset():
+            keys.assign(np.concatenate([keys_np, np.zeros(count, dtype=np_dtype)]))  # noqa: B023
+            values.assign(np.concatenate([values_np, np.zeros(count, dtype=np.int32)]))  # noqa: B023
+
+        reset()
+        wp.utils.segmented_sort_pairs(keys, values, count, starts, ends)
+        with wp.ScopedCapture(device, force_module_load=False) as capture:
+            wp.utils.segmented_sort_pairs(keys, values, count, starts, ends)
+
+        reset()
+        wp.capture_launch(capture.graph)
+
+        sorted_keys = keys.numpy()[:count]
+        sorted_values = values.numpy()[:count]
+        for s, e in zip(starts_np, ends_np, strict=True):
+            order = np.argsort(keys_np[s:e], kind="stable")
+            np.testing.assert_array_equal(sorted_keys[s:e], keys_np[s:e][order])
+            np.testing.assert_array_equal(keys_np[sorted_values[s:e]], sorted_keys[s:e])
+
+
 def test_segmented_sort_pairs(test, device):
     keyTypes = [int, wp.float32]
 
@@ -1175,6 +1221,12 @@ add_function_test(
     TestUtils,
     "test_segmented_sort_pairs_graph_capture",
     test_segmented_sort_pairs_graph_capture,
+    devices=get_selected_cuda_test_devices(),
+)
+add_function_test(
+    TestUtils,
+    "test_segmented_sort_pairs_graph_capture_many_segments",
+    test_segmented_sort_pairs_graph_capture_many_segments,
     devices=get_selected_cuda_test_devices(),
 )
 add_function_test(TestUtils, "test_radix_sort_pairs_signed_keys", test_radix_sort_pairs_signed_keys, devices=devices)

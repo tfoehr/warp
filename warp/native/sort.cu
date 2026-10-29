@@ -11,6 +11,7 @@
 
 #define THRUST_IGNORE_CUB_VERSION_CHECK
 
+#include <algorithm>
 #include <cassert>
 #include <mutex>
 #include <unordered_map>
@@ -482,6 +483,55 @@ void wp_radix_sort_pairs_uint64_device(
     );
 }
 
+#if defined(__HIP_PLATFORM_AMD__)
+// With many segments, rocPRIM's segmented radix sort partitions them by size and reads the
+// partition counts back to the host with a blocking copy, which fails while the stream is
+// capturing and invalidates the capture. Sort without partitioning during graph captures.
+using segmented_sort_capture_config = rocprim::segmented_radix_sort_config<
+    8, rocprim::kernel_config<256, 8>, rocprim::DisabledWarpSortConfig, false>;
+
+static bool stream_is_capturing(CUstream stream)
+{
+    hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+    return hipStreamIsCapturing(stream, &status) == hipSuccess && status == hipStreamCaptureStatusActive;
+}
+#endif
+
+// Sort keys and values within segments, updating the double buffer selectors like cub.
+template <typename Key>
+static cudaError_t segmented_radix_sort_pairs(
+    void* temp,
+    size_t& temp_size,
+    cub::DoubleBuffer<Key>& keys,
+    cub::DoubleBuffer<int>& values,
+    int n,
+    int num_segments,
+    int* segment_start_indices,
+    int* segment_end_indices,
+    CUstream stream,
+    bool capture_safe
+)
+{
+#if defined(__HIP_PLATFORM_AMD__)
+    if (capture_safe) {
+        rocprim::double_buffer<Key> rp_keys(keys.Current(), keys.Alternate());
+        rocprim::double_buffer<int> rp_values(values.Current(), values.Alternate());
+        hipError_t result = rocprim::segmented_radix_sort_pairs<segmented_sort_capture_config>(
+            temp, temp_size, rp_keys, rp_values, n, num_segments, segment_start_indices, segment_end_indices, 0, 32,
+            stream
+        );
+        keys.selector = rp_keys.current() == keys.d_buffers[1];
+        values.selector = rp_values.current() == values.d_buffers[1];
+        return result;
+    }
+#else
+    (void)capture_safe;
+#endif
+    return cub::DeviceSegmentedRadixSort::SortPairs(
+        temp, temp_size, keys, values, n, num_segments, segment_start_indices, segment_end_indices, 0, 32, stream
+    );
+}
+
 size_t segmented_sort_temp_size(void* context, int n, int num_segments)
 {
     ContextGuard guard(context);
@@ -496,15 +546,22 @@ size_t segmented_sort_temp_size(void* context, int n, int num_segments)
 
     // compute temporary memory required
     size_t sort_temp_size;
-    if (check_cuda(
-            cub::DeviceSegmentedRadixSort::SortPairs(
-                NULL, sort_temp_size, d_keys, d_values, n, num_segments, start_indices, end_indices, 0, 32, stream
-            )
-        )) {
-        return sort_temp_size;
-    } else {
+    if (!check_cuda(segmented_radix_sort_pairs(
+            NULL, sort_temp_size, d_keys, d_values, n, num_segments, start_indices, end_indices, stream, false
+        )))
         return 0;
-    }
+
+#if defined(__HIP_PLATFORM_AMD__)
+    // the same buffer must also fit the capture-safe configuration
+    size_t capture_temp_size;
+    if (!check_cuda(segmented_radix_sort_pairs(
+            NULL, capture_temp_size, d_keys, d_values, n, num_segments, start_indices, end_indices, stream, true
+        )))
+        return 0;
+    sort_temp_size = std::max(sort_temp_size, capture_temp_size);
+#endif
+
+    return sort_temp_size;
 }
 
 // segment_start_indices and segment_end_indices are arrays of length num_segments, where segment_start_indices[i] is
@@ -534,13 +591,16 @@ void segmented_sort_pairs_device(
         return;
     }
 
+    bool capture_safe = false;
+#if defined(__HIP_PLATFORM_AMD__)
+    capture_safe = stream_is_capturing(stream);
+#endif
+
     // sort
-    check_cuda(
-        cub::DeviceSegmentedRadixSort::SortPairs(
-            temp.mem, temp.size, d_keys, d_values, n, num_segments, segment_start_indices, segment_end_indices, 0, 32,
-            stream
-        )
-    );
+    check_cuda(segmented_radix_sort_pairs(
+        temp.mem, temp.size, d_keys, d_values, n, num_segments, segment_start_indices, segment_end_indices, stream,
+        capture_safe
+    ));
 
     release_temp_buffer(temp);
 
@@ -590,13 +650,16 @@ void segmented_sort_pairs_device(
         return;
     }
 
+    bool capture_safe = false;
+#if defined(__HIP_PLATFORM_AMD__)
+    capture_safe = stream_is_capturing(stream);
+#endif
+
     // sort
-    check_cuda(
-        cub::DeviceSegmentedRadixSort::SortPairs(
-            temp.mem, temp.size, d_keys, d_values, n, num_segments, segment_start_indices, segment_end_indices, 0, 32,
-            stream
-        )
-    );
+    check_cuda(segmented_radix_sort_pairs(
+        temp.mem, temp.size, d_keys, d_values, n, num_segments, segment_start_indices, segment_end_indices, stream,
+        capture_safe
+    ));
 
     release_temp_buffer(temp);
 

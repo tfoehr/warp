@@ -421,6 +421,11 @@ command processor stops reading it and the host blocks in the next launch, with 
 Before a graph launch on a HIP device, the host waits for earlier graph launches on the same
 stream to complete until the nodes in flight, including the new launch, fit this budget. A graph
 larger than the budget waits for all earlier launches. ``0`` disables the limit.
+
+Completion is tracked with an event recorded after every eighth of the budget rather than after
+every launch (recording an event costs several microseconds of host time on ROCm), and the count
+restarts whenever an emulated conditional (see :attr:`hip_conditional_graph_emulation`) has read
+a condition value, because the stream has drained at that point.
 """
 
 hip_conditional_graph_wait: str = "spin"

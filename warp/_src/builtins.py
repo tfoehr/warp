@@ -3383,7 +3383,10 @@ def tile_load_indexed_tuple_value_func(arg_types: Mapping[str, type], arg_values
     a = arg_types["a"]
 
     indices_tile = arg_types["indices"]
-    indices_tile.storage = "shared"  # force to shared
+    if a.ndim != 1:
+        # A thread needs the indices of other threads' elements. A 1D load keeps a register indices
+        # tile in registers: each thread reads the indices of exactly the elements it loads.
+        indices_tile.storage = "shared"
 
     axis = arg_values["axis"]
     if axis >= a.ndim:

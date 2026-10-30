@@ -94,6 +94,9 @@ inline CUDA_CALLABLE void scalar_cholesky_impl(TileA& A, TileOut& Out)
         // Diagonal: redundant compute on all threads.
         T s = A.data(tile_coord(j, j));
 
+        // Unrolled so that the shared-memory loads of several k are in flight at once (the
+        // accumulation order, and so the result, is unchanged).
+        WP_TILE_UNROLL_DOT
         for (int k = 0; k < j; ++k) {
             T r = Out.data(idx(j, k));
             s -= r * r;
@@ -106,6 +109,7 @@ inline CUDA_CALLABLE void scalar_cholesky_impl(TileA& A, TileOut& Out)
         for (int i = j + 1 + WP_TILE_THREAD_IDX; i < n; i += WP_TILE_BLOCK_DIM) {
             T s_i = Upper ? A.data(tile_coord(j, i)) : A.data(tile_coord(i, j));
 
+            WP_TILE_UNROLL_DOT
             for (int k = 0; k < j; ++k) {
                 s_i -= Out.data(idx(i, k)) * Out.data(idx(j, k));
             }

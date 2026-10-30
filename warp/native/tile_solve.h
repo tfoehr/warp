@@ -52,6 +52,97 @@ namespace wp {
 
 namespace partitioned_gemm {
 
+#if defined(__HIP_DEVICE_COMPILE__)
+// Wave-parallel triangular solve with a single right-hand side (HIP devices).
+//
+// The serial vector-RHS path below runs on one thread and walks a dependent chain of shared-memory
+// loads (n^2/2 steps); without libmathdx on AMD GPUs it dominated the solver kernels that use it.
+// Here the first wavefront solves: lane l keeps rows l, l + W, l + 2W, ... of the right-hand side in
+// registers. For each step i (ascending for forward, descending for backward substitution) the
+// owner lane's row value and diagonal are broadcast with v_readlane, x[i] = b[i] / M(i, i) is stored
+// by the owner, and every lane subtracts M(r, i) * x[i] from its remaining rows. The remaining waves
+// only wait at the trailing barrier; no lane waits on another lane's memory writes.
+//
+// Forward substitution applies the updates of x[0..i-1] to row i in the same order as the serial
+// loop; backward substitution applies them in descending order, so its results can differ from the
+// serial loop in the last bits.
+template <typename Tile> inline __device__ auto wave_solve_vec_coord(int i)
+{
+    if constexpr (Tile::Layout::Shape::N == 1)
+        return tile_coord(i);
+    else
+        return tile_coord(i, 0);
+}
+
+template <typename T> struct wave_solve_supported {
+    static constexpr bool value = is_same<T, float>::value || is_same<T, double>::value;
+};
+
+// Broadcast the value of lane ``src`` (uniform across the wavefront) with v_readlane, which unlike
+// __shfl (ds_bpermute) does not round-trip through the LDS unit.
+template <typename T> inline __device__ T wave_broadcast(T v, int src)
+{
+    if constexpr (sizeof(T) == 4) {
+        return __int_as_float(__builtin_amdgcn_readlane(__float_as_int(v), src));
+    } else {
+        const long long bits = __double_as_longlong(v);
+        const int lo = __builtin_amdgcn_readlane(int(bits & 0xffffffffll), src);
+        const int hi = __builtin_amdgcn_readlane(int(bits >> 32), src);
+        return __longlong_as_double((static_cast<long long>(hi) << 32) | static_cast<unsigned int>(lo));
+    }
+}
+
+// M(r, c) returns the matrix element of the triangular system in solve orientation:
+// forward: lower triangular (c <= r), backward: upper triangular (c >= r).
+template <bool Backward, int n, typename T, typename MatF, typename TileX, typename TileY>
+inline __device__ void wave_triangular_solve_vec(MatF M, TileX& X, TileY& Y)
+{
+    constexpr int W = WP_TILE_BLOCK_DIM < WP_TILE_WARP_SIZE ? WP_TILE_BLOCK_DIM : WP_TILE_WARP_SIZE;
+    constexpr int R = (n + W - 1) / W;
+    const int lane = WP_TILE_THREAD_IDX;
+
+    if (lane < W) {
+        T b[R];  // right-hand side, then partially reduced rows
+        T d[R];  // diagonal
+#pragma unroll
+        for (int q = 0; q < R; ++q) {
+            const int r = lane + q * W;
+            b[q] = r < n ? T(Y.data(wave_solve_vec_coord<TileY>(r))) : T(0);
+            d[q] = r < n ? T(M(r, r)) : T(1);
+        }
+
+#pragma unroll
+        for (int qq = 0; qq < R; ++qq) {
+            const int qi = Backward ? R - 1 - qq : qq;
+            // unrolled so that the loads of M(r, i) of several steps are in flight at once
+#pragma unroll 8
+            for (int jj = 0; jj < W; ++jj) {
+                const int j = Backward ? W - 1 - jj : jj;
+                const int i = qi * W + j;
+                if (i >= n)
+                    continue;  // uniform across the wavefront
+
+                const T diag = wave_broadcast(d[qi], j);
+                const T s = wave_broadcast(b[qi], j);
+                const T xi = (diag != T(0.0f)) ? s / diag : s;
+                if (lane == j)
+                    X.data(wave_solve_vec_coord<TileX>(i)) = xi;
+
+#pragma unroll
+                for (int q = 0; q < R; ++q) {
+                    if (Backward ? (q > qi) : (q < qi))
+                        continue;  // rows already solved
+                    const int r = lane + q * W;
+                    if (Backward ? (r < i) : (r > i && r < n))
+                        b[q] -= M(r, i) * xi;
+                }
+            }
+        }
+    }
+    WP_TILE_SYNC();
+}
+#endif
+
 // Writes into X (the result vector or matrix).
 //
 // Two paths gated on the rank of TileY:
@@ -78,6 +169,20 @@ inline CUDA_CALLABLE void scalar_cholesky_forward_substitution(TileA& A, TileX& 
 
     auto idx = [](int row, int col) { return Upper ? tile_coord(col, row) : tile_coord(row, col); };
 
+#if defined(__HIP_DEVICE_COMPILE__)
+    if constexpr (
+        wave_solve_supported<T>::value
+        && (TileY::Layout::Shape::N == 1 || (TileY::Layout::Shape::N == 2 && TileY::Layout::Shape::dim(1) == 1))
+    ) {
+        constexpr int n = TileA::Layout::Shape::dim(1);
+        // wave-parallel path (see wave_triangular_solve_vec)
+        WP_TILE_SYNC();  // X may alias Y; all prior writes to Y must be visible
+        auto M = [&A, idx](int r, int c) { return A.data(idx(r, c)); };
+        wave_triangular_solve_vec<false, n, T>(M, X, Y);
+        return;
+    }
+#endif
+
     if constexpr (TileY::Layout::Shape::N == 1) {
         constexpr int n = TileA::Layout::Shape::dim(1);
 
@@ -85,6 +190,7 @@ inline CUDA_CALLABLE void scalar_cholesky_forward_substitution(TileA& A, TileX& 
             for (int i = 0; i < n; ++i) {
                 T s = Y.data(tile_coord(i));
 
+                WP_TILE_UNROLL_DOT
                 for (int j = 0; j < i; ++j)
                     s -= A.data(idx(i, j)) * X.data(tile_coord(j));
 
@@ -101,6 +207,7 @@ inline CUDA_CALLABLE void scalar_cholesky_forward_substitution(TileA& A, TileX& 
             for (int i = 0; i < n; ++i) {
                 T s = Y.data(tile_coord(i, k));
 
+                WP_TILE_UNROLL_DOT
                 for (int j = 0; j < i; ++j)
                     s -= A.data(idx(i, j)) * X.data(tile_coord(j, k));
 
@@ -125,6 +232,19 @@ inline CUDA_CALLABLE void scalar_cholesky_back_substitution(TileA& A, TileX& X)
 
     auto idx = [](int row, int col) { return Upper ? tile_coord(row, col) : tile_coord(col, row); };
 
+#if defined(__HIP_DEVICE_COMPILE__)
+    if constexpr (
+        wave_solve_supported<T>::value
+        && (TileX::Layout::Shape::N == 1 || (TileX::Layout::Shape::N == 2 && TileX::Layout::Shape::dim(1) == 1))
+    ) {
+        constexpr int n = TileA::Layout::Shape::dim(1);
+        WP_TILE_SYNC();
+        auto M = [&A, idx](int r, int c) { return A.data(idx(r, c)); };
+        wave_triangular_solve_vec<true, n, T>(M, X, X);
+        return;
+    }
+#endif
+
     if constexpr (TileX::Layout::Shape::N == 1) {
         constexpr int n = TileA::Layout::Shape::dim(1);
 
@@ -132,6 +252,7 @@ inline CUDA_CALLABLE void scalar_cholesky_back_substitution(TileA& A, TileX& X)
             for (int i = n - 1; i >= 0; --i) {
                 T s = X.data(tile_coord(i));
 
+                WP_TILE_UNROLL_DOT
                 for (int j = i + 1; j < n; ++j)
                     s -= A.data(idx(i, j)) * X.data(tile_coord(j));
 
@@ -148,6 +269,7 @@ inline CUDA_CALLABLE void scalar_cholesky_back_substitution(TileA& A, TileX& X)
             for (int i = n - 1; i >= 0; --i) {
                 T s = X.data(tile_coord(i, k));
 
+                WP_TILE_UNROLL_DOT
                 for (int j = i + 1; j < n; ++j)
                     s -= A.data(idx(i, j)) * X.data(tile_coord(j, k));
 

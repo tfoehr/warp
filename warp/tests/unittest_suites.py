@@ -96,6 +96,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     # before building this suite, and importing all test modules here registers
     # their kernels only after that point.
     from warp.tests.cuda.test_array_fill_capture import TestArrayFillCapture
+    from warp.tests.cuda.test_memset_device import TestMemsetDevice
     from warp.tests.cuda.test_async import TestAsync
     from warp.tests.cuda.test_capture_mode import TestCaptureMode
     from warp.tests.cuda.test_clang_cuda import TestClangCUDA
@@ -302,6 +303,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestArithmetic,
         TestArray,
         TestArrayFillCapture,
+        TestMemsetDevice,
         TestArrayReduce,
         TestAsync,
         TestAtomic,
@@ -527,6 +529,7 @@ def debug_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader):
     # test kernels before a focused debug suite is selected.
     from warp.tests.aot.test_module_aot import TestModuleAOT
     from warp.tests.cuda.test_array_fill_capture import TestArrayFillCapture
+    from warp.tests.cuda.test_memset_device import TestMemsetDevice
     from warp.tests.cuda.test_capture_mode import TestCaptureMode
     from warp.tests.cuda.test_clang_cuda import TestClangCUDA
     from warp.tests.cuda.test_cluster_dim import TestClusterDim
@@ -798,6 +801,7 @@ def debug_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader):
         # Additional classes verified to pass under debug mode within the job's time budget.
         TestModuleAOT,
         TestArrayFillCapture,
+        TestMemsetDevice,
         TestCaptureMode,
         TestClangCUDA,
         TestClusterDim,

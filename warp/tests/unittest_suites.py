@@ -285,6 +285,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     )
     from warp.tests.tile.test_tile_solve import TestTileSolve
     from warp.tests.tile.test_tile_solve_no_mathdx import TestTileSolveNoMathDx
+    from warp.tests.tile.test_tile_solve_sizes import TestTileSolveSizes
     from warp.tests.tile.test_tile_sort import TestTileSort
     from warp.tests.tile.test_tile_stack import TestTileStack
     from warp.tests.tile.test_tile_struct import TestTileStruct
@@ -460,6 +461,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestTileSharedMemoryMessages,
         TestTileSolve,
         TestTileSolveNoMathDx,
+        TestTileSolveSizes,
         TestTileSort,
         TestTileStack,
         TestTileStruct,
@@ -719,6 +721,7 @@ def debug_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader):
     from warp.tests.tile.test_tile_shared_memory import TestTileSharedMemory, TestTileSharedMemoryMessages
     from warp.tests.tile.test_tile_solve import TestTileSolve
     from warp.tests.tile.test_tile_solve_no_mathdx import TestTileSolveNoMathDx
+    from warp.tests.tile.test_tile_solve_sizes import TestTileSolveSizes
     from warp.tests.tile.test_tile_sort import TestTileSort
     from warp.tests.tile.test_tile_stack import TestTileStack
     from warp.tests.tile.test_tile_view import TestTileView
@@ -921,6 +924,7 @@ def debug_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader):
         TestTileLargeOffsets,
         TestTileSolve,
         TestTileSolveNoMathDx,
+        TestTileSolveSizes,
         TestTileStack,
         TestGroupedBvh,
         TestMeshQueryPoint,

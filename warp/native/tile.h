@@ -104,6 +104,15 @@ struct alignas(16) float4 {
 
 #define WP_USE_REGISTER_GEMM 0
 
+// Unroll hint for the dot-product loops of the scalar tile solvers. Their trip counts are only known
+// at run time, so without the hint each iteration waits for its shared-memory load before issuing the
+// next one. On GPUs this keeps several loads in flight; it does not change the order of operations.
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+#define WP_TILE_UNROLL_DOT _Pragma("unroll 8")
+#else
+#define WP_TILE_UNROLL_DOT
+#endif
+
 // Type trait to detect null function placeholder (int literal 0).
 // Used to switch between scalar and LTO code paths at template instantiation time.
 template <typename T> struct wp_is_null_func {

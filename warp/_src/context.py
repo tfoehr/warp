@@ -13555,6 +13555,8 @@ class _HipConditionReader:
         value = word.value
         if (value >> 1) != expected:
             raise RuntimeError("Emulated conditional graph lost track of a condition value (unexpected sequence)")
+        # the value is published by the last operation queued on the stream: the stream has drained
+        _hip_stream_drained(stream)
         return (value & 1) != 0
 
 
@@ -13780,8 +13782,36 @@ def _hip_splice_launch(device: Device, stream: Stream, outer: Graph, graph: Grap
         _hip_begin_segment(device, stream, outer)
 
 
-# per HIP stream: [deque of (completion event, node count), total node count]
-_hip_graph_launches_in_flight: dict[int, list] = {}
+class _HipLaunchBudget:
+    """Graph nodes queued on one HIP stream and not known to have completed.
+
+    See :attr:`warp.config.hip_graph_max_inflight_nodes`. Recording an event costs several
+    microseconds of host time on ROCm, so instead of one event per launch, an event is recorded
+    once the launches not yet covered by an event reach an eighth of the budget. Waiting on such
+    an event retires all launches it covers; the most recent, uncovered launches are retired by a
+    stream synchronization if they have to be. The accounting is reset when the host has observed
+    that the stream drained (an emulated conditional read the value published at its end).
+    """
+
+    __slots__ = ("events", "spare", "total", "uncovered")
+
+    def __init__(self):
+        self.events = collections.deque()  # (event, nodes covered), oldest first
+        self.spare = []  # recorded events known to have completed, for reuse
+        self.total = 0  # nodes in flight: the events' nodes plus the uncovered ones
+        self.uncovered = 0  # nodes launched since the last recorded event
+
+    def drained(self) -> None:
+        """Forget all launches: everything queued on the stream so far has completed."""
+        if self.events:
+            self.spare.extend(e for e, _ in self.events)
+            self.events.clear()
+        self.total = 0
+        self.uncovered = 0
+
+
+# per HIP stream handle
+_hip_launch_budgets: dict[int, _HipLaunchBudget] = {}
 
 
 def _hip_graph_node_count(graph: Graph) -> int:
@@ -13801,21 +13831,44 @@ def _hip_graph_launch(graph: Graph, stream: Stream) -> None:
     See :attr:`warp.config.hip_graph_max_inflight_nodes`.
     """
     limit = warp.config.hip_graph_max_inflight_nodes
-    if limit > 0:
-        nodes = _hip_graph_node_count(graph)
-        state = _hip_graph_launches_in_flight.setdefault(stream.cuda_stream, [collections.deque(), 0])
-        in_flight = state[0]
-        while in_flight and state[1] + nodes > limit:
-            event, n = in_flight.popleft()
-            synchronize_event(event)
-            state[1] -= n
+    if limit <= 0:
+        if not runtime.core.wp_cuda_graph_launch(graph.graph_exec, stream.cuda_stream):
+            raise RuntimeError(f"Graph launch error: {runtime.get_error_string()}")
+        return
+
+    nodes = graph._hip_node_count if hasattr(graph, "_hip_node_count") else _hip_graph_node_count(graph)
+    budget = _hip_launch_budgets.get(stream.cuda_stream)
+    if budget is None:
+        budget = _hip_launch_budgets[stream.cuda_stream] = _HipLaunchBudget()
+
+    if budget.total + nodes > limit:
+        events = budget.events
+        while events and budget.total + nodes > limit:
+            event, n = events.popleft()
+            runtime.core.wp_cuda_event_synchronize(event.cuda_event)
+            budget.spare.append(event)
+            budget.total -= n
+        if budget.total + nodes > limit and budget.uncovered:
+            runtime.core.wp_cuda_stream_synchronize(stream.cuda_stream)
+            budget.drained()
 
     if not runtime.core.wp_cuda_graph_launch(graph.graph_exec, stream.cuda_stream):
         raise RuntimeError(f"Graph launch error: {runtime.get_error_string()}")
 
-    if limit > 0:
-        in_flight.append((stream.record_event(), nodes))
-        state[1] += nodes
+    budget.total += nodes
+    budget.uncovered += nodes
+    if budget.uncovered * 8 >= limit:
+        event = budget.spare.pop() if budget.spare else Event(stream.device)
+        runtime.core.wp_cuda_event_record(event.cuda_event, stream.cuda_stream, False)
+        budget.events.append((event, budget.uncovered))
+        budget.uncovered = 0
+
+
+def _hip_stream_drained(stream: Stream) -> None:
+    """Note that all work queued on ``stream`` so far has completed (for the launch budget)."""
+    budget = _hip_launch_budgets.get(stream.cuda_stream)
+    if budget is not None and budget.total:
+        budget.drained()
 
 
 def _hip_launch_segment(segment: Graph, stream: Stream) -> None:

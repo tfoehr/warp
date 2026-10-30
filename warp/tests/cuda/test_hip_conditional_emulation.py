@@ -591,6 +591,62 @@ def benchmark_conditional_overhead(device=None, iterations=1000, repeats=5, wait
     return results
 
 
+def _launch_budget(device):
+    from warp._src import context  # noqa: PLC0415
+
+    return context._hip_launch_budgets.get(device.stream.cuda_stream)
+
+
+def test_launch_budget_bounds(test, device):
+    # graphs smaller than, close to and larger than the in-flight node budget, replayed back to
+    # back: the nodes in flight must stay within the budget and every replay must take effect
+    limit = 64
+    with wp.ScopedDevice(device), _ConfigOverride(hip_graph_max_inflight_nodes=limit):
+        a = wp.zeros(4, dtype=wp.int32)
+        wp.load_module(device=device)
+        graphs = []
+        for nodes in (1, 5, 40, 100):
+            with wp.ScopedCapture(force_module_load=False) as capture:
+                for _ in range(nodes):
+                    launch_add(a, 1)
+            graphs.append((nodes, capture.graph))
+
+        wp.synchronize_device(device)
+        expected = 0
+        for i in range(300):
+            nodes, graph = graphs[(i * 7) % len(graphs)]
+            wp.capture_launch(graph)
+            expected += nodes
+            budget = _launch_budget(device)
+            test.assertLessEqual(budget.total, max(limit, nodes))
+            test.assertEqual(budget.total, sum(n for _, n in budget.events) + budget.uncovered)
+        np.testing.assert_array_equal(a.numpy(), [expected] * 4)
+
+
+def test_launch_budget_drained_by_condition(test, device):
+    # reading a published condition means the stream has drained: the budget restarts from zero
+    with wp.ScopedDevice(device), _ConfigOverride(hip_graph_max_inflight_nodes=16):
+        a = wp.zeros(3, dtype=wp.int32)
+        count = wp.zeros(1, dtype=wp.int32)
+        wp.load_module(device=device)
+
+        def body():
+            for _ in range(6):
+                launch_add(a, 1)
+            wp.launch(decrement_kernel, dim=1, inputs=[count])
+
+        with wp.ScopedCapture(force_module_load=False) as capture:
+            wp.capture_while(count, while_body=body)
+
+        for iterations in (0, 1, 9, 40):
+            a.zero_()
+            count.fill_(iterations)
+            wp.capture_launch(capture.graph)
+            # the program ends with the read of the final (false) condition
+            test.assertEqual(_launch_budget(device).total, 0)
+            np.testing.assert_array_equal(a.numpy(), [6 * iterations] * 3)
+
+
 def test_benchmark_smoke(test, device):
     results = benchmark_conditional_overhead(device, iterations=20, repeats=1)
     for key, value in results.items():
@@ -625,6 +681,8 @@ for _name, _func in (
     ("test_other_stream", test_other_stream),
     ("test_debug_dot_print", test_debug_dot_print),
     ("test_capture_save_rejected", test_capture_save_rejected),
+    ("test_launch_budget_bounds", test_launch_budget_bounds),
+    ("test_launch_budget_drained_by_condition", test_launch_budget_drained_by_condition),
     ("test_benchmark_smoke", test_benchmark_smoke),
 ):
     add_function_test(TestHipConditionalEmulation, _name, _func, devices=hip_devices)

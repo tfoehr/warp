@@ -225,6 +225,77 @@ def test_tile_atomic_add_indexed(test, device):
     assert_np_equal(x.grad.numpy(), x_grad_np)
 
 
+REG_N = wp.constant(100)  # not a multiple of the block size
+
+
+@wp.kernel
+def tile_indexed_register_indices_kernel(
+    src: wp.array[float],
+    idx: wp.array[int],
+    gathered: wp.array[float],
+    gathered_shared: wp.array[float],
+    scattered: wp.array[float],
+    accumulated: wp.array[float],
+):
+    # a 1D indexed load keeps a register indices tile in registers (each thread reads the indices
+    # of the elements it loads) instead of moving it to shared memory
+    indices = wp.tile_load(idx, shape=(REG_N,))
+    t = wp.tile_load_indexed(src, indices=indices, shape=(REG_N,))
+    wp.tile_store(gathered, t)
+    t_shared = wp.tile_load_indexed(src, indices=indices, shape=(REG_N,), storage="shared")
+    wp.tile_store(gathered_shared, t_shared)
+    # indexed stores and atomic adds move their indices tile to shared memory
+    indices_s = wp.tile_load(idx, shape=(REG_N,))
+    values = wp.tile_load(src, shape=(REG_N,))
+    wp.tile_store_indexed(scattered, indices=indices_s, t=values)
+    wp.tile_atomic_add_indexed(accumulated, indices=indices_s, t=values)
+
+
+def test_tile_indexed_register_indices(test, device):
+    rng = np.random.default_rng(42)
+    perm = rng.permutation(REG_N).astype(np.int32)
+    perm[3] = -1  # out of bounds: reads as zero, stores and adds are skipped
+    perm[57] = REG_N
+    src_np = rng.standard_normal(REG_N).astype(np.float32)
+    valid = (perm >= 0) & (perm < REG_N)
+
+    expected_gather = np.where(valid, src_np[np.clip(perm, 0, REG_N - 1)], 0.0).astype(np.float32)
+    expected_scatter = np.zeros(REG_N, dtype=np.float32)
+    expected_scatter[perm[valid]] = src_np[valid]
+    expected_grad = np.zeros(REG_N, dtype=np.float32)
+    np.add.at(expected_grad, perm[valid], 1.0)
+
+    for block_dim in (32, 64, 128):
+        with test.subTest(block_dim=block_dim):
+            src = wp.array(src_np, dtype=float, requires_grad=True, device=device)
+            idx = wp.array(perm, dtype=int, device=device)
+            gathered = wp.zeros(REG_N, dtype=float, requires_grad=True, device=device)
+            gathered_shared = wp.zeros(REG_N, dtype=float, requires_grad=True, device=device)
+            scattered = wp.zeros(REG_N, dtype=float, requires_grad=True, device=device)
+            accumulated = wp.zeros(REG_N, dtype=float, requires_grad=True, device=device)
+
+            with wp.Tape() as tape:
+                wp.launch_tiled(
+                    tile_indexed_register_indices_kernel,
+                    dim=1,
+                    inputs=[src, idx],
+                    outputs=[gathered, gathered_shared, scattered, accumulated],
+                    block_dim=block_dim,
+                    device=device,
+                )
+
+            assert_np_equal(gathered.numpy(), expected_gather)
+            assert_np_equal(gathered_shared.numpy(), expected_gather)
+            assert_np_equal(scattered.numpy(), expected_scatter)
+            assert_np_equal(accumulated.numpy(), expected_scatter)
+
+            # gradient of the register-indexed gather only
+            gathered.grad = wp.ones_like(gathered)
+            tape.backward()
+            # the store and atomic add also propagate their (zero) output gradients to src
+            assert_np_equal(src.grad.numpy(), expected_grad)
+
+
 devices = get_test_devices()
 
 
@@ -246,6 +317,12 @@ add_function_test(
     devices=devices,
 )
 add_function_test(TestTileLoadIndexed, "test_tile_store_indexed", test_tile_store_indexed, devices=devices)
+add_function_test(
+    TestTileLoadIndexed,
+    "test_tile_indexed_register_indices",
+    test_tile_indexed_register_indices,
+    devices=devices,
+)
 add_function_test(
     TestTileLoadIndexed,
     "test_tile_atomic_add_indexed",

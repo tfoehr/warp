@@ -2724,6 +2724,62 @@ def _get_cpu_feature_set() -> frozenset[str]:
     return _cpu_feature_set_cache
 
 
+# Digest of the native headers and libraries that generated kernel code depends on.
+_native_build_digest_cache: bytes | None = None
+_NATIVE_HEADER_SUFFIXES = (".h", ".hpp", ".cuh", ".inl")
+
+
+def _get_native_build_digest() -> bytes:
+    """Return a digest of the native headers and the native library files.
+
+    Generated kernels ``#include`` the headers in ``warp/native`` when they are compiled at
+    runtime, so a header change alters the binary of every module without changing its Python
+    source. Folding this digest into the module hash keeps the kernel cache from serving
+    binaries built against older headers (or by an older native library, e.g. with other
+    compiler flags) when Warp is modified without bumping its version.
+
+    Header contents are hashed (about 3 ms for ~2.8 MB, once per process, on the first module
+    hash); the libraries are identified by size and modification time only.
+    """
+    global _native_build_digest_cache
+    if _native_build_digest_cache is not None:
+        return _native_build_digest_cache
+
+    ch = hashlib.sha256(b"warp-native-build-v1")
+    native_dir = os.path.join(warp_home, "native")
+    for dirpath, dirnames, filenames in os.walk(native_dir):
+        dirnames.sort()
+        for name in sorted(filenames):
+            if not name.endswith(_NATIVE_HEADER_SUFFIXES):
+                continue
+            path = os.path.join(dirpath, name)
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            ch.update(os.path.relpath(path, native_dir).replace(os.sep, "/").encode("utf-8"))
+            ch.update(len(data).to_bytes(8, "little"))
+            ch.update(data)
+
+    bin_dir = os.path.join(warp_home, "bin")
+    try:
+        lib_names = sorted(os.listdir(bin_dir))
+    except OSError:
+        lib_names = []
+    for name in lib_names:
+        if not name.endswith((".so", ".dll", ".dylib")):
+            continue
+        try:
+            st = os.stat(os.path.join(bin_dir, name))
+        except OSError:
+            continue
+        ch.update(f"{name}:{st.st_size}:{st.st_mtime_ns}".encode())
+
+    _native_build_digest_cache = ch.digest()
+    return _native_build_digest_cache
+
+
 # Cached CPU toolchain version — computed once after the native library is loaded.
 _cpu_toolchain_version_cache: str | None = None
 
@@ -2884,6 +2940,9 @@ class ModuleHasher:
         for opt in sorted(options.keys()):
             s = f"{opt}:{options[opt]}"
             ch.update(bytes(s, "utf-8"))
+
+        # native headers and libraries the generated code is compiled against
+        ch.update(_get_native_build_digest())
 
         # Note: cuda_output defaults to None in the options dict and is not
         # resolved before hashing, so modules with different cuda_output

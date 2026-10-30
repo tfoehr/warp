@@ -2950,10 +2950,33 @@ inline CUDA_CALLABLE auto tile_load(array_t<T>& src, Offset... offset)
     return tile_global_t<T, tile_shape_t<Shape...>, BoundsCheck, Aligned>(src, tile_coord(offset...));
 }
 
+template <typename X> struct is_register_tile {
+    static constexpr bool value = false;
+};
+template <typename T, typename L> struct is_register_tile<tile_register_t<T, L>> {
+    static constexpr bool value = true;
+};
+
+// Index along the indexed axis for the element at coordinate c, which is held in register ``reg``
+// of the register tile being loaded or stored. A shared indices tile is read at c[axis]. A register
+// indices tile (only for 1D tiles, whose shape equals the indices tile's shape, so both use the
+// same register layout) is read from the calling thread's own register ``reg``; it avoids staging
+// the indices in shared memory.
+template <typename IndicesTile, typename Coord>
+inline CUDA_CALLABLE int tile_index_lookup(IndicesTile& indices, int axis, Coord c, int reg)
+{
+    if constexpr (is_register_tile<IndicesTile>::value) {
+        static_assert(Coord::size() == 1, "A register indices tile requires a 1D tile; use storage=\"shared\"");
+        return indices.data[reg];
+    } else {
+        return indices.data(c[axis]);
+    }
+}
+
 // used for indexed loads and stores
 template <typename T, typename IndicesTile, typename Coord>
 inline CUDA_CALLABLE bool
-compute_index(array_t<T>& src, IndicesTile& indices, int axis, Coord offset, Coord c, int64_t& out)
+compute_index(array_t<T>& src, IndicesTile& indices, int axis, Coord offset, Coord c, int reg, int64_t& out)
 {
     // Byte total can exceed 2 GiB; accumulate in 64-bit.
     int64_t byte_index = 0;
@@ -2962,7 +2985,7 @@ compute_index(array_t<T>& src, IndicesTile& indices, int axis, Coord offset, Coo
     for (int i = 0; i < Coord::size(); ++i) {
         if (i == axis) {
             // global = offset_coord + index_mapped_coord
-            int index_along_axis = offset[i] + indices.data(c[i]);
+            int index_along_axis = offset[i] + tile_index_lookup(indices, i, c, reg);
 
             // out of bounds on either side predicates to zero, so a -1 index
             // acts as a padding sentinel (no physical zero row required)
@@ -2996,7 +3019,7 @@ inline CUDA_CALLABLE auto tile_load_indexed(array_t<T>& src, IndicesTile& indice
 
     out.apply([&](int reg, auto c) {
         int64_t i;
-        if (compute_index(src, indices, axis, offset_coord, c, i))
+        if (compute_index(src, indices, axis, offset_coord, c, reg, i))
             out.data[reg] = src.data[i];
         else
             out.data[reg] = T {};
@@ -3043,7 +3066,7 @@ inline CUDA_CALLABLE void tile_store_indexed(
 
     src_reg.apply([&](int reg, auto c) {
         int64_t i;
-        if (compute_index(dest, indices, axis, offset, c, i))
+        if (compute_index(dest, indices, axis, offset, c, reg, i))
             dest.data[i] = src_reg.data[reg];
     });
 }
@@ -3137,7 +3160,7 @@ inline CUDA_CALLABLE auto tile_atomic_add_indexed(
 
     src_reg.apply([&](int reg, auto c) {
         int64_t i;
-        if (compute_index(dest, indices, axis, offset, c, i))
+        if (compute_index(dest, indices, axis, offset, c, reg, i))
             ret_reg.data[reg] = tile_atomic_add_value(&dest.data[i], src_reg.data[reg]);
         else
             ret_reg.data[reg] = T {};
@@ -3276,7 +3299,7 @@ inline CUDA_CALLABLE void adj_tile_load_indexed(
 
     adj_ret_reg.apply([&](int reg, auto c) {
         int64_t i;
-        if (compute_index(src, indices, axis, offset, c, i))
+        if (compute_index(src, indices, axis, offset, c, reg, i))
             tile_adj_atomic_add_value(&src.grad[i], adj_ret_reg.data[reg]);
     });
 }
@@ -3449,7 +3472,7 @@ inline CUDA_CALLABLE void adj_tile_store_indexed(
 
     adj_t_reg.apply([&](int reg, auto c) {
         int64_t i;
-        if (compute_index(dest, indices, axis, offset, c, i)) {
+        if (compute_index(dest, indices, axis, offset, c, reg, i)) {
             adj_t_reg.data[reg] += dest.grad[i];
             dest.grad[i] = T();
         }
@@ -3635,7 +3658,7 @@ inline CUDA_CALLABLE void adj_tile_atomic_add_indexed(
 
     adj_t_reg.apply([&](int reg, auto c) {
         int64_t i;
-        if (compute_index(dest, indices, axis, offset, c, i))
+        if (compute_index(dest, indices, axis, offset, c, reg, i))
             adj_t_reg.data[reg] += dest.grad[i];
     });
 

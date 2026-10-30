@@ -1567,6 +1567,50 @@ __global__ void memset_kernel(int* dest, int value, size_t n)
     }
 }
 
+#if defined(__HIP_PLATFORM_AMD__)
+// ROCm implements hipMemsetAsync with up to three fill kernels (head, 16-byte aligned body and
+// tail), so a memset whose size is not a multiple of 16 bytes costs two or three dispatches; in a
+// graph, each is a node with ~2.4 us of launch gap on gfx1151. This kernel sets any byte range in
+// one dispatch: thread i covers the i-th 16-byte aligned chunk overlapping the range, storing whole
+// chunks as one 16-byte vector and partial chunks byte by byte. It writes only inside the range.
+__global__ void memset_single_dispatch_kernel(uint8_t* dst, uint32_t value4, size_t n, size_t num_chunks)
+{
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(dst);
+    const uintptr_t end = begin + n;
+    const uintptr_t base = begin & ~static_cast<uintptr_t>(15);
+    const size_t grid_stride = static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x);
+    for (size_t i = static_cast<size_t>(blockDim.x) * static_cast<size_t>(blockIdx.x) + static_cast<size_t>(threadIdx.x);
+         i < num_chunks; i += grid_stride) {
+        const uintptr_t chunk = base + 16 * i;
+        if (chunk >= begin && chunk + 16 <= end) {
+            *reinterpret_cast<uint4*>(chunk) = make_uint4(value4, value4, value4, value4);
+        } else {
+            const uintptr_t lo = chunk > begin ? chunk : begin;
+            const uintptr_t hi = chunk + 16 < end ? chunk + 16 : end;
+            for (uintptr_t p = lo; p < hi; ++p)
+                *reinterpret_cast<uint8_t*>(p) = static_cast<uint8_t>(value4);
+        }
+    }
+}
+
+static bool memset_single_dispatch(void* dest, int value, size_t n, cudaStream_t stream)
+{
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(dest);
+    const uintptr_t base = begin & ~static_cast<uintptr_t>(15);
+    const size_t num_chunks = (begin + n - base + 15) / 16;
+    const uint32_t value4 = static_cast<uint32_t>(value & 0xff) * 0x01010101u;
+    const int num_threads = 256;
+    const size_t max_blocks = 4096;  // grid-stride beyond 16 MB
+    size_t num_blocks = (num_chunks + num_threads - 1) / num_threads;
+    if (num_blocks > max_blocks)
+        num_blocks = max_blocks;
+    memset_single_dispatch_kernel<<<static_cast<unsigned int>(num_blocks), num_threads, 0, stream>>>(
+        static_cast<uint8_t*>(dest), value4, n, num_chunks
+    );
+    return check_cuda(cudaGetLastError());
+}
+#endif
+
 bool wp_memset_device(void* context, void* dest, int value, size_t n, void* stream)
 {
     // A zero-length memset is a no-op. CUDA's cudaMemsetAsync accepts (dest,0)
@@ -1587,7 +1631,11 @@ bool wp_memset_device(void* context, void* dest, int value, size_t n, void* stre
 
     begin_cuda_range(WP_TIMING_MEMSET, cuda_stream, context, "memset");
 
+#if defined(__HIP_PLATFORM_AMD__)
+    bool result = memset_single_dispatch(dest, value, n, cuda_stream);
+#else
     bool result = check_cuda(cudaMemsetAsync(dest, value, n, cuda_stream));
+#endif
 
     end_cuda_range(WP_TIMING_MEMSET, cuda_stream);
 

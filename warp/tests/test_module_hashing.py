@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from importlib import util
 
 import warp as wp
+import warp._src.context as ctx
 from warp._src.context import ModuleBuilder, ModuleHasher
 from warp.tests.unittest_utils import *
 
@@ -414,6 +415,66 @@ class TestModuleHasherKernelOptions(unittest.TestCase):
 
         self.assertNotEqual(make(32).module.hash_module(), make(64).module.hash_module())
         self.assertEqual(make(32).module.hash_module(), make(32).module.hash_module())
+
+
+class TestNativeBuildDigest(unittest.TestCase):
+    """The module hash must change with the native headers that generated code includes."""
+
+    def setUp(self):
+        self._saved_cache = ctx._native_build_digest_cache
+        self._saved_home = ctx.warp_home
+
+    def tearDown(self):
+        ctx._native_build_digest_cache = self._saved_cache
+        ctx.warp_home = self._saved_home
+
+    @staticmethod
+    def _make_kernel():
+        @wp.kernel(module="unique")
+        def k(a: wp.array[int]):
+            a[wp.tid()] = 1
+
+        return k
+
+    def test_digest_tracks_header_contents(self):
+        with tempfile.TemporaryDirectory() as home:
+            os.makedirs(os.path.join(home, "native", "sub"))
+            os.makedirs(os.path.join(home, "bin"))
+            header = os.path.join(home, "native", "sub", "tile_x.h")
+            with open(header, "w") as f:
+                f.write("#define X 1\n")
+            with open(os.path.join(home, "native", "warp.cpp"), "w") as f:
+                f.write("// library source\n")
+            ctx.warp_home = home
+
+            ctx._native_build_digest_cache = None
+            d1 = ctx._get_native_build_digest()
+            ctx._native_build_digest_cache = None
+            self.assertEqual(ctx._get_native_build_digest(), d1)
+
+            # library sources are compiled into the native library, not into kernels
+            with open(os.path.join(home, "native", "warp.cpp"), "w") as f:
+                f.write("// changed library source\n")
+            ctx._native_build_digest_cache = None
+            self.assertEqual(ctx._get_native_build_digest(), d1)
+
+            with open(header, "w") as f:
+                f.write("#define X 2\n")
+            ctx._native_build_digest_cache = None
+            d2 = ctx._get_native_build_digest()
+            self.assertNotEqual(d2, d1)
+
+            with open(os.path.join(home, "bin", "warp.so"), "wb") as f:
+                f.write(b"lib")
+            ctx._native_build_digest_cache = None
+            self.assertNotEqual(ctx._get_native_build_digest(), d2)
+
+    def test_module_hash_includes_digest(self):
+        ctx._native_build_digest_cache = b"a" * 32
+        h_a = self._make_kernel().module.hash_module()
+        self.assertEqual(self._make_kernel().module.hash_module(), h_a)
+        ctx._native_build_digest_cache = b"b" * 32
+        self.assertNotEqual(self._make_kernel().module.hash_module(), h_a)
 
 
 class TestModuleHashing(unittest.TestCase):
